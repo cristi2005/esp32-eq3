@@ -230,15 +230,26 @@ size_t EQ3Speaker::play(const uint8_t *data, size_t length, TickType_t ticks_to_
     this->start();
   }
 
+  ticks_to_wait = std::min(ticks_to_wait, MAX_OUTPUT_TICKS_TO_WAIT);
+
   if (!this->output_speaker_->is_running() || this->process_buffer_ == nullptr) {
-    // Not ready yet - the caller is expected to retry, matching the play() contract.
+    // Not ready yet - the caller is expected to retry, matching the play() contract. Crucially, actually
+    // wait out ticks_to_wait here (mirroring the mixer's own SourceSpeaker::play() "not ready" branch,
+    // which does the same via vTaskDelay) instead of returning instantly. A caller that retries in a
+    // tight loop - like the mixer's dedicated task, which runs at a HIGHER FreeRTOS priority than the
+    // main loop task - would otherwise spin at full CPU speed with no yield at all every time this
+    // branch is hit, starving lower-priority tasks (including the main loop task that feeds the task
+    // watchdog) long enough to trip it. This is the real root cause of the "mixer" task watchdog reboot:
+    // it reproduces any time the output speaker briefly reports not-running (e.g. while the i2s pipeline
+    // settles around a Bluetooth on/off transition), even with no real audio flowing at all - the
+    // earlier single-chunk and 50ms-clamp fixes narrowed the window but never closed this fast path.
+    vTaskDelay(ticks_to_wait);
     return 0;
   }
 
   const uint8_t bytes_per_sample = this->audio_stream_info_.get_bits_per_sample() / 8;
   const uint8_t channels = this->audio_stream_info_.get_channels();
   const size_t frame_size = static_cast<size_t>(bytes_per_sample) * channels;
-  ticks_to_wait = std::min(ticks_to_wait, MAX_OUTPUT_TICKS_TO_WAIT);
 
   if (bytes_per_sample == 0 || channels == 0 || channels > EQ3_MAX_CHANNELS) {
     // Unexpected/unsupported format - pass through unfiltered rather than dropping audio.
@@ -254,6 +265,10 @@ size_t EQ3Speaker::play(const uint8_t *data, size_t length, TickType_t ticks_to_
   size_t chunk = std::min(length, this->process_buffer_size_);
   chunk = (chunk / frame_size) * frame_size;
   if (chunk == 0) {
+    // Less than one frame was offered - nothing to do yet. Wait out ticks_to_wait rather than returning
+    // instantly, for the same reason as the "not ready" branch above: a tight-looping caller must not be
+    // able to spin here with zero yield.
+    vTaskDelay(ticks_to_wait);
     return 0;
   }
 
