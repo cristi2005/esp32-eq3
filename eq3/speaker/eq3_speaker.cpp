@@ -15,6 +15,12 @@ static const char *const TAG = "eq3_speaker";
 // to keep the per-call overhead reasonable.
 static const uint32_t PROCESS_BUFFER_DURATION_MS = 20;
 
+// Upper bound on how long a single play() call is allowed to block downstream, regardless of what
+// ticks_to_wait the caller (e.g. the mixer task) passes in. EQ3 is just a filter-and-forward passthrough
+// in the middle of the audio chain - it must never be the reason a caller's task stalls long enough to
+// trip the watchdog, even if the physical speaker or its I2C control bus is temporarily stuck.
+static const TickType_t MAX_OUTPUT_TICKS_TO_WAIT = pdMS_TO_TICKS(50);
+
 static const float BASS_FREQUENCY_HZ = 300.0f;
 static const float MID_FREQUENCY_HZ = 1000.0f;
 static const float MID_Q = 0.8f;
@@ -232,6 +238,8 @@ size_t EQ3Speaker::play(const uint8_t *data, size_t length, TickType_t ticks_to_
   const uint8_t bytes_per_sample = this->audio_stream_info_.get_bits_per_sample() / 8;
   const uint8_t channels = this->audio_stream_info_.get_channels();
   const size_t frame_size = static_cast<size_t>(bytes_per_sample) * channels;
+  ticks_to_wait = std::min(ticks_to_wait, MAX_OUTPUT_TICKS_TO_WAIT);
+
   if (bytes_per_sample == 0 || channels == 0 || channels > EQ3_MAX_CHANNELS) {
     // Unexpected/unsupported format - pass through unfiltered rather than dropping audio.
     return this->output_speaker_->play(data, length, ticks_to_wait);
