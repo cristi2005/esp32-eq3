@@ -237,35 +237,29 @@ size_t EQ3Speaker::play(const uint8_t *data, size_t length, TickType_t ticks_to_
     return this->output_speaker_->play(data, length, ticks_to_wait);
   }
 
-  size_t total_written = 0;
-  while (total_written < length) {
-    size_t chunk = std::min(length - total_written, this->process_buffer_size_);
-    chunk = (chunk / frame_size) * frame_size;
-    if (chunk == 0) {
-      break;
-    }
-
-    const uint8_t *src = data + total_written;
-    uint8_t *dst = this->process_buffer_.get();
-    for (size_t offset = 0; offset < chunk; offset += bytes_per_sample) {
-      const uint8_t channel = (offset / bytes_per_sample) % channels;
-      const int32_t sample_q31 = audio::unpack_audio_sample_to_q31(src + offset, bytes_per_sample);
-      float sample_f = static_cast<float>(sample_q31) / 2147483648.0f;
-      sample_f = this->process_sample_(sample_f, channel);
-      const int32_t out_q31 = static_cast<int32_t>(sample_f * 2147483648.0f);
-      audio::pack_q31_as_audio_sample(out_q31, dst + offset, bytes_per_sample);
-    }
-
-    size_t written = this->output_speaker_->play(dst, chunk, ticks_to_wait);
-    total_written += written;
-    if (written < chunk) {
-      // Output is momentarily full. The remaining filtered bytes are dropped rather than resent, since
-      // the filter state has already advanced past them - a rare edge case with no audible impact.
-      break;
-    }
+  // Filter and forward at most one process_buffer_-sized, frame-aligned chunk per call - never loop here
+  // calling output_speaker_->play() repeatedly. Each of those calls can block for up to ticks_to_wait
+  // (e.g. waiting for I2S DMA buffer space); looping let a single caller's play() call (the mixer, on its
+  // own task) block for a multiple of that, long enough to starve its task loop and trip the watchdog -
+  // this is what caused the "mixer" task watchdog reboot once real audio started flowing. Returning a
+  // partial count here is normal Speaker::play() contract: the caller retries with the remainder.
+  size_t chunk = std::min(length, this->process_buffer_size_);
+  chunk = (chunk / frame_size) * frame_size;
+  if (chunk == 0) {
+    return 0;
   }
 
-  return total_written;
+  uint8_t *dst = this->process_buffer_.get();
+  for (size_t offset = 0; offset < chunk; offset += bytes_per_sample) {
+    const uint8_t channel = (offset / bytes_per_sample) % channels;
+    const int32_t sample_q31 = audio::unpack_audio_sample_to_q31(data + offset, bytes_per_sample);
+    float sample_f = static_cast<float>(sample_q31) / 2147483648.0f;
+    sample_f = this->process_sample_(sample_f, channel);
+    const int32_t out_q31 = static_cast<int32_t>(sample_f * 2147483648.0f);
+    audio::pack_q31_as_audio_sample(out_q31, dst + offset, bytes_per_sample);
+  }
+
+  return this->output_speaker_->play(dst, chunk, ticks_to_wait);
 }
 
 }  // namespace esphome::eq3
