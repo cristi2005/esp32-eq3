@@ -71,6 +71,12 @@ class EQ3Speaker final : public Component, public speaker::Speaker {
   /// a stale value for one block is harmless for a level display.
   float get_level() const { return this->level_; }
 
+  /// @brief Average (RMS) energy of the most recently filtered block, normalized to [0, 1].
+  /// A VU meter needs both numbers: the bar follows this average, while the floating dot follows
+  /// get_level(). Music typically peaks 10-15 dB above its average, which is exactly what puts a
+  /// visible gap between the two on the display.
+  float get_rms_level() const { return this->rms_level_; }
+
  protected:
   void update_bass_coeffs_();
   void update_mid_coeffs_();
@@ -100,6 +106,9 @@ class EQ3Speaker final : public Component, public speaker::Speaker {
 
   // Loudest absolute sample of the last processed block, normalized to [0, 1].
   volatile float level_{0.0f};
+
+  // Average (RMS) energy of the last processed block, normalized to [0, 1].
+  volatile float rms_level_{0.0f};
 
   // Linear factor applied to every sample before the filters. 1.0 when no band is boosted.
   float pre_gain_{1.0f};
