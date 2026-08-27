@@ -65,6 +65,12 @@ class EQ3Speaker final : public Component, public speaker::Speaker {
   /// @brief Sets the treble (high shelf, ~3 kHz) gain in dB (-12..+12) and recomputes its coefficients.
   void set_treble_gain_db(float gain_db);
 
+  /// @brief Loudest sample seen in the most recently filtered block, normalized to [0, 1].
+  /// Written from the audio task inside play() and read from the main loop (e.g. to drive a VU
+  /// meter), so it is a plain 32-bit float - reads and writes of one are atomic on this chip, and
+  /// a stale value for one block is harmless for a level display.
+  float get_level() const { return this->level_; }
+
  protected:
   void update_bass_coeffs_();
   void update_mid_coeffs_();
@@ -91,6 +97,9 @@ class EQ3Speaker final : public Component, public speaker::Speaker {
   float bass_gain_db_{0.0f};
   float mid_gain_db_{0.0f};
   float treble_gain_db_{0.0f};
+
+  // Loudest absolute sample of the last processed block, normalized to [0, 1].
+  volatile float level_{0.0f};
 
   // Linear factor applied to every sample before the filters. 1.0 when no band is boosted.
   float pre_gain_{1.0f};
