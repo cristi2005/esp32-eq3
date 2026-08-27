@@ -166,6 +166,7 @@ void EQ3Speaker::start() {
 
 void EQ3Speaker::stop() {
   this->level_ = 0.0f;
+  this->rms_level_ = 0.0f;
   this->output_speaker_->stop();
   this->state_ = speaker::STATE_STOPPING;
 }
@@ -286,17 +287,22 @@ size_t EQ3Speaker::play(const uint8_t *data, size_t length, TickType_t ticks_to_
 
   uint8_t *dst = this->process_buffer_.get();
   float block_peak = 0.0f;
+  float sum_of_squares = 0.0f;
+  size_t sample_count = 0;
   for (size_t offset = 0; offset < chunk; offset += bytes_per_sample) {
     const uint8_t channel = (offset / bytes_per_sample) % channels;
     const int32_t sample_q31 = audio::unpack_audio_sample_to_q31(data + offset, bytes_per_sample);
     float sample_f = static_cast<float>(sample_q31) / 2147483648.0f;
     sample_f = this->process_sample_(sample_f, channel);
     block_peak = std::max(block_peak, std::fabs(sample_f));
+    sum_of_squares += sample_f * sample_f;
+    ++sample_count;
     const int32_t out_q31 = static_cast<int32_t>(sample_f * 2147483648.0f);
     audio::pack_q31_as_audio_sample(out_q31, dst + offset, bytes_per_sample);
   }
-  // Publish the block's peak for whoever wants to display the level (see get_level()).
+  // Publish both numbers a VU meter needs: the block's peak and its average energy.
   this->level_ = block_peak;
+  this->rms_level_ = (sample_count > 0) ? std::sqrt(sum_of_squares / static_cast<float>(sample_count)) : 0.0f;
 
   return this->output_speaker_->play(dst, chunk, ticks_to_wait);
 }
