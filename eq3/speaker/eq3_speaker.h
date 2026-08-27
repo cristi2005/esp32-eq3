@@ -70,6 +70,14 @@ class EQ3Speaker final : public Component, public speaker::Speaker {
   void update_mid_coeffs_();
   void update_treble_coeffs_();
 
+  /// @brief Recomputes the safety attenuation applied before filtering. Boosting a band raises the
+  /// signal, and audio that is already near full scale would then exceed it and get hard-clipped by
+  /// process_sample_(), which is audible as harsh crackling - worst on loud, heavily compressed
+  /// material such as rock, while quiet material like classical stays clean. Attenuating the input
+  /// by the largest boost first guarantees the cascade can never exceed full scale. The cost is
+  /// lower overall loudness, which the user compensates with the volume control.
+  void update_pre_gain_();
+
   /// @brief Runs one sample (normalized to [-1, 1)) through the 3-band cascade for the given channel.
   float process_sample_(float x, uint8_t channel);
 
@@ -83,6 +91,9 @@ class EQ3Speaker final : public Component, public speaker::Speaker {
   float bass_gain_db_{0.0f};
   float mid_gain_db_{0.0f};
   float treble_gain_db_{0.0f};
+
+  // Linear factor applied to every sample before the filters. 1.0 when no band is boosted.
+  float pre_gain_{1.0f};
 
   BiquadCoeffs bass_coeffs_;
   BiquadCoeffs mid_coeffs_;
