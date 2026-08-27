@@ -98,9 +98,10 @@ void EQ3Speaker::dump_config() {
                 "EQ3 Speaker:\n"
                 "  Bass Gain: %.1f dB (~%.0f Hz shelf)\n"
                 "  Mid Gain: %.1f dB (~%.0f Hz bell)\n"
-                "  Treble Gain: %.1f dB (~%.0f Hz shelf)",
+                "  Treble Gain: %.1f dB (~%.0f Hz shelf)\n"
+                "  Headroom attenuation: %.1f dB",
                 this->bass_gain_db_, BASS_FREQUENCY_HZ, this->mid_gain_db_, MID_FREQUENCY_HZ,
-                this->treble_gain_db_, TREBLE_FREQUENCY_HZ);
+                this->treble_gain_db_, TREBLE_FREQUENCY_HZ, 20.0f * log10f(this->pre_gain_));
 }
 
 void EQ3Speaker::setup() {}
@@ -148,6 +149,7 @@ void EQ3Speaker::start() {
     this->process_buffer_size_ = wanted_size;
   }
 
+  this->update_pre_gain_();
   this->update_bass_coeffs_();
   this->update_mid_coeffs_();
   this->update_treble_coeffs_();
@@ -184,6 +186,7 @@ void EQ3Speaker::set_volume(float volume) {
 
 void EQ3Speaker::set_bass_gain_db(float gain_db) {
   this->bass_gain_db_ = gain_db;
+  this->update_pre_gain_();
   if (this->audio_stream_info_.get_sample_rate() > 0) {
     this->update_bass_coeffs_();
   }
@@ -191,6 +194,7 @@ void EQ3Speaker::set_bass_gain_db(float gain_db) {
 
 void EQ3Speaker::set_mid_gain_db(float gain_db) {
   this->mid_gain_db_ = gain_db;
+  this->update_pre_gain_();
   if (this->audio_stream_info_.get_sample_rate() > 0) {
     this->update_mid_coeffs_();
   }
@@ -198,9 +202,15 @@ void EQ3Speaker::set_mid_gain_db(float gain_db) {
 
 void EQ3Speaker::set_treble_gain_db(float gain_db) {
   this->treble_gain_db_ = gain_db;
+  this->update_pre_gain_();
   if (this->audio_stream_info_.get_sample_rate() > 0) {
     this->update_treble_coeffs_();
   }
+}
+
+void EQ3Speaker::update_pre_gain_() {
+  const float largest_boost_db = std::max(0.0f, std::max(this->bass_gain_db_, std::max(this->mid_gain_db_, this->treble_gain_db_)));
+  this->pre_gain_ = powf(10.0f, -largest_boost_db / 20.0f);
 }
 
 void EQ3Speaker::update_bass_coeffs_() {
@@ -219,6 +229,7 @@ void EQ3Speaker::update_treble_coeffs_() {
 }
 
 float EQ3Speaker::process_sample_(float x, uint8_t channel) {
+  x *= this->pre_gain_;
   x = apply_biquad(x, this->bass_coeffs_, this->bass_state_[channel]);
   x = apply_biquad(x, this->mid_coeffs_, this->mid_state_[channel]);
   x = apply_biquad(x, this->treble_coeffs_, this->treble_state_[channel]);
