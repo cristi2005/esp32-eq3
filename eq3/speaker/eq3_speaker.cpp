@@ -165,8 +165,10 @@ void EQ3Speaker::start() {
 }
 
 void EQ3Speaker::stop() {
-  this->level_ = 0.0f;
-  this->rms_level_ = 0.0f;
+  for (uint8_t ch = 0; ch < EQ3_MAX_CHANNELS; ch++) {
+    this->level_[ch] = 0.0f;
+    this->rms_level_[ch] = 0.0f;
+  }
   this->output_speaker_->stop();
   this->state_ = speaker::STATE_STOPPING;
 }
@@ -286,23 +288,34 @@ size_t EQ3Speaker::play(const uint8_t *data, size_t length, TickType_t ticks_to_
   }
 
   uint8_t *dst = this->process_buffer_.get();
-  float block_peak = 0.0f;
-  float sum_of_squares = 0.0f;
-  size_t sample_count = 0;
+  // Measured per channel, so a stereo VU meter can show left and right independently.
+  float block_peak[EQ3_MAX_CHANNELS] = {};
+  float sum_of_squares[EQ3_MAX_CHANNELS] = {};
+  size_t sample_count[EQ3_MAX_CHANNELS] = {};
   for (size_t offset = 0; offset < chunk; offset += bytes_per_sample) {
     const uint8_t channel = (offset / bytes_per_sample) % channels;
     const int32_t sample_q31 = audio::unpack_audio_sample_to_q31(data + offset, bytes_per_sample);
     float sample_f = static_cast<float>(sample_q31) / 2147483648.0f;
     sample_f = this->process_sample_(sample_f, channel);
-    block_peak = std::max(block_peak, std::fabs(sample_f));
-    sum_of_squares += sample_f * sample_f;
-    ++sample_count;
+    block_peak[channel] = std::max(block_peak[channel], std::fabs(sample_f));
+    sum_of_squares[channel] += sample_f * sample_f;
+    ++sample_count[channel];
     const int32_t out_q31 = static_cast<int32_t>(sample_f * 2147483648.0f);
     audio::pack_q31_as_audio_sample(out_q31, dst + offset, bytes_per_sample);
   }
-  // Publish both numbers a VU meter needs: the block's peak and its average energy.
-  this->level_ = block_peak;
-  this->rms_level_ = (sample_count > 0) ? std::sqrt(sum_of_squares / static_cast<float>(sample_count)) : 0.0f;
+  // Publish both numbers a VU meter needs, for each channel: peak and average energy.
+  for (uint8_t ch = 0; ch < EQ3_MAX_CHANNELS; ch++) {
+    this->level_[ch] = block_peak[ch];
+    this->rms_level_[ch] =
+        (sample_count[ch] > 0) ? std::sqrt(sum_of_squares[ch] / static_cast<float>(sample_count[ch])) : 0.0f;
+  }
+  // A mono stream only fills channel 0 - mirror it so both halves of a stereo display light up.
+  if (channels == 1) {
+    for (uint8_t ch = 1; ch < EQ3_MAX_CHANNELS; ch++) {
+      this->level_[ch] = this->level_[0];
+      this->rms_level_[ch] = this->rms_level_[0];
+    }
+  }
 
   return this->output_speaker_->play(dst, chunk, ticks_to_wait);
 }
