@@ -19,6 +19,11 @@ class SDCard : public Component {
   float get_setup_priority() const override { return setup_priority::DATA; }
 
   void setup() override;
+  // Serverul web NU se poate porni din setup(): componenta noastra ruleaza cu prioritatea DATA
+  // (600), iar WiFi-ul abia cu 250 - adica DUPA noi. Pornit inainte ca reteaua sa existe,
+  // serverul incearca sa deschida socket-uri intr-o stiva neinitializata si placa se reseteaza.
+  // In loop() suntem siguri ca tot setup-ul s-a terminat, retea inclusa.
+  void loop() override;
   void dump_config() override;
 
   void set_mount_point(const std::string &mount_point) { this->mount_point_ = mount_point; }
@@ -31,8 +36,12 @@ class SDCard : public Component {
   void list_files(const std::string &path);
 
   /// @brief Reciteste folderul de muzica si reface lista de melodii. Apeleaz-o dupa ce ai
-  /// copiat fisiere noi pe card fara sa repornesti placa.
+  /// copiat fisiere noi pe card fara sa repornesti placa. Scrie in log doar numarul gasit.
   void scan_music();
+
+  /// @brief Scrie in log lista completa de melodii. Separata de scan_music dinadins: in setup()
+  /// zeci de linii de log una dupa alta ingroapa consola si ascund ce e important.
+  void log_tracks();
 
   /// @brief Cate melodii sunt in lista.
   int track_count() const { return (int) this->tracks_.size(); }
@@ -56,6 +65,7 @@ class SDCard : public Component {
   uint64_t size_mb_{0};
   char name_[8]{};
 
+  bool server_pornit_{false};
   httpd_handle_t server_{nullptr};
   uint8_t *buffer_{nullptr};
 
