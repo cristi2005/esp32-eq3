@@ -124,7 +124,16 @@ void SDCard::setup() {
   ESP_LOGI(TAG, "Card montat la %s: %s, %llu MB", this->mount_point_.c_str(), this->name_, this->size_mb_);
 
   this->scan_music();
-  this->start_http_server_();
+  // Serverul se porneste in loop(), nu aici - vezi explicatia de la declaratia lui loop().
+}
+
+void SDCard::loop() {
+  if (!this->server_pornit_) {
+    this->server_pornit_ = true;
+    this->start_http_server_();
+  }
+  // Nu mai avem nimic de facut in bucla - o oprim, ca sa nu incarcam degeaba placa.
+  this->disable_loop();
 }
 
 void SDCard::start_http_server_() {
@@ -247,7 +256,11 @@ void SDCard::scan_music() {
 
   std::sort(this->tracks_.begin(), this->tracks_.end());
 
-  ESP_LOGI(TAG, "Am gasit %d melodii in %s:", (int) this->tracks_.size(), this->music_folder_.c_str());
+  ESP_LOGI(TAG, "Am gasit %d melodii in %s.", (int) this->tracks_.size(), this->music_folder_.c_str());
+}
+
+void SDCard::log_tracks() {
+  ESP_LOGI(TAG, "Lista de melodii (%d):", (int) this->tracks_.size());
   for (size_t i = 0; i < this->tracks_.size(); i++) {
     ESP_LOGI(TAG, "  %2d. %s", (int) (i + 1), this->tracks_[i].c_str());
   }
