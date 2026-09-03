@@ -68,6 +68,7 @@ class SDCard : public Component {
   bool server_pornit_{false};
   httpd_handle_t server_{nullptr};
   uint8_t *buffer_{nullptr};
+  size_t buffer_size_{0};
 
   std::vector<std::string> tracks_;
 };
