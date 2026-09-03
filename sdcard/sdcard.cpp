@@ -6,6 +6,7 @@
 #include "esphome/core/log.h"
 
 #include "driver/sdmmc_host.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 
 #include <freertos/FreeRTOS.h>
@@ -23,11 +24,8 @@ namespace esphome::sdcard {
 
 static const char *const TAG = "sdcard";
 
-// Cat citim din card dintr-o data. Marit de la 4 KB la 16 KB dupa ce s-au auzit intreruperi:
-// citirile mari inseamna mai putine drumuri la card si mai putine bucati trimise, deci mai
-// putine ocazii ca rezerva de sunet sa se goleasca intre doua citiri. Nu ne costa memorie
-// interna - rezerva se cere din PSRAM.
-static constexpr size_t BUFFER_SIZE = 16384;
+// Cat citim din card dintr-o data. 8 KB, si OBLIGATORIU din memoria interna - vezi mai jos de ce.
+static constexpr size_t BUFFER_SIZE = 8192;
 static constexpr size_t MAX_TRACKS = 200;
 
 namespace {
@@ -220,17 +218,25 @@ void SDCard::start_http_server_() {
     return;
   }
 
-  // Rezerva de citire o cerem intai din memoria externa (PSRAM), ca sa nu consumam din cea
-  // interna, care e la 74%. Daca nu e PSRAM, se ia din cea interna.
-  RAMAllocator<uint8_t> allocator{RAMAllocator<uint8_t>::ALLOC_EXTERNAL};
-  this->buffer_ = allocator.allocate(BUFFER_SIZE);
+  // AICI ERA CAUZA INTRERUPERILOR, si e scrisa in documentatia Espressif despre driverul de card.
+  //
+  // Cititorul de card nu poate scrie direct in memoria externa (PSRAM) - acolo nu ajunge canalul
+  // lui de transfer direct. Cand ii dai o rezerva din PSRAM, driverul nu refuza: se descurca
+  // singur, copiind prin propria lui rezerva interna, dar o face BLOC CU BLOC, cate 512 octeti,
+  // fiecare cu comanda lui separata catre card si cu o alocare de memorie proprie.
+  //
+  // Adica citirea noastra de 16 KB se rupea in 32 de transferuri marunte, cu 32 de alocari.
+  // De-aia o citire dura 120-150 ms in loc de vreo 10, si de-aia macina procesorul si memoria
+  // exact in timpul redarii. Radioul nu suferea fiindca el nu atinge niciodata cardul.
+  //
+  // Rezerva trebuie sa fie in memoria INTERNA si potrivita pentru transfer direct. Costa 8 KB
+  // din cei ~31 liberi, dar transformă 32 de transferuri intr-unul singur.
+  this->buffer_ = (uint8_t *) heap_caps_malloc(BUFFER_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+  this->buffer_size_ = BUFFER_SIZE;
   if (this->buffer_ == nullptr) {
-    // Fara PSRAM disponibila, incercam si memoria interna - dar cu o rezerva mai mica.
-    RAMAllocator<uint8_t> intern{RAMAllocator<uint8_t>::ALLOC_INTERNAL};
-    this->buffer_ = intern.allocate(4096);
+    // Ultima incercare, cu o rezerva mai mica.
+    this->buffer_ = (uint8_t *) heap_caps_malloc(4096, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
     this->buffer_size_ = 4096;
-  } else {
-    this->buffer_size_ = BUFFER_SIZE;
   }
   if (this->buffer_ == nullptr) {
     ESP_LOGE(TAG, "Nu am memorie pentru rezerva de citire - serverul nu porneste.");
