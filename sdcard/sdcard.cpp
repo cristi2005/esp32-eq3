@@ -6,6 +6,7 @@
 #include "esphome/core/log.h"
 
 #include "driver/sdmmc_host.h"
+#include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 
@@ -220,15 +221,57 @@ esp_err_t SDCard::http_handler_(httpd_req_t *request) {
   // Tipul trebuie trimis corect: placa se uita la el ca sa stie ce decodor sa foloseasca.
   httpd_resp_set_type(request, mime);
 
+  // MASURATOARE (temporara, pentru intreruperi): cronometram separat citirea de pe card si
+  // trimiterea catre player. Daca sunetul se rupe, una din cele doua se opreste undeva.
+  // Scriem in log doar cand chiar dureaza mult, altfel am ineca consola.
+  static constexpr int64_t PRAG_US = 120000;  // 120 ms
+  int64_t total_card_us = 0;
+  int64_t total_retea_us = 0;
+  int64_t maxim_card_us = 0;
+  int64_t maxim_retea_us = 0;
+  uint32_t bucati = 0;
+
   size_t citit;
-  while ((citit = fread(self->buffer_, 1, self->buffer_size_, fisier)) > 0) {
-    if (httpd_resp_send_chunk(request, (const char *) self->buffer_, citit) != ESP_OK) {
+  while (true) {
+    int64_t t0 = esp_timer_get_time();
+    citit = fread(self->buffer_, 1, self->buffer_size_, fisier);
+    int64_t t1 = esp_timer_get_time();
+    if (citit == 0) {
+      break;
+    }
+
+    esp_err_t trimis = httpd_resp_send_chunk(request, (const char *) self->buffer_, citit);
+    int64_t t2 = esp_timer_get_time();
+
+    const int64_t card_us = t1 - t0;
+    const int64_t retea_us = t2 - t1;
+    total_card_us += card_us;
+    total_retea_us += retea_us;
+    maxim_card_us = std::max(maxim_card_us, card_us);
+    maxim_retea_us = std::max(maxim_retea_us, retea_us);
+    bucati++;
+
+    if (card_us > PRAG_US || retea_us > PRAG_US) {
+      ESP_LOGW(TAG, "Bucata %u: cititul de pe card %lld ms, trimiterea %lld ms", (unsigned) bucati,
+               (long long) (card_us / 1000), (long long) (retea_us / 1000));
+    }
+
+    if (trimis != ESP_OK) {
       // Playerul a inchis legatura (ai schimbat melodia, de exemplu) - nu e o eroare.
       fclose(fisier);
+      ESP_LOGI(TAG, "Oprit dupa %u bucati. Card: %lld ms total, cel mai lung %lld ms. "
+                    "Trimitere: %lld ms total, cea mai lunga %lld ms.",
+               (unsigned) bucati, (long long) (total_card_us / 1000), (long long) (maxim_card_us / 1000),
+               (long long) (total_retea_us / 1000), (long long) (maxim_retea_us / 1000));
       return ESP_FAIL;
     }
   }
   fclose(fisier);
+
+  ESP_LOGI(TAG, "Fisier terminat: %u bucati. Card: %lld ms total, cel mai lung %lld ms. "
+                "Trimitere: %lld ms total, cea mai lunga %lld ms.",
+           (unsigned) bucati, (long long) (total_card_us / 1000), (long long) (maxim_card_us / 1000),
+           (long long) (total_retea_us / 1000), (long long) (maxim_retea_us / 1000));
 
   // Bucata de lungime zero inseamna "am terminat".
   httpd_resp_send_chunk(request, nullptr, 0);
