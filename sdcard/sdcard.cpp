@@ -25,7 +25,7 @@ namespace esphome::sdcard {
 static const char *const TAG = "sdcard";
 
 // Cat citim din card dintr-o data. 8 KB, si OBLIGATORIU din memoria interna - vezi mai jos de ce.
-static constexpr size_t BUFFER_SIZE = 8192;
+static constexpr size_t BUFFER_SIZE = 4096;
 static constexpr size_t MAX_TRACKS = 200;
 
 namespace {
@@ -229,8 +229,10 @@ void SDCard::start_http_server_() {
   // De-aia o citire dura 120-150 ms in loc de vreo 10, si de-aia macina procesorul si memoria
   // exact in timpul redarii. Radioul nu suferea fiindca el nu atinge niciodata cardul.
   //
-  // Rezerva trebuie sa fie in memoria INTERNA si potrivita pentru transfer direct. Costa 8 KB
-  // din cei ~31 liberi, dar transformă 32 de transferuri intr-unul singur.
+  // Rezerva trebuie sa fie in memoria INTERNA si potrivita pentru transfer direct.
+  // 4 KB, nu 8: cu 8 KB placa a ramas fara memorie interna in timpul redarii - au aparut
+  // "allocate_dma_buf: not enough mem" si "HTTP_CLIENT: Failed to allocate memory". Memoria
+  // interna e resursa cea mai scumpa de pe placa asta.
   this->buffer_ = (uint8_t *) heap_caps_malloc(BUFFER_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
   this->buffer_size_ = BUFFER_SIZE;
   if (this->buffer_ == nullptr) {
@@ -258,10 +260,12 @@ void SDCard::start_http_server_() {
   // din ce am oprit: egalizator, leduri, pagina web - toate stau si ele pe prioritate mica.
   // Pus pe 1, serverul si decodorul isi impart procesorul in mod egal, pe rand.
   config.task_priority = 1;
-  config.max_open_sockets = 2;
+  // Un singur socket: servim o singura melodie la un moment dat, iar fiecare socket costa
+  // memorie interna, care e pe terminate.
+  config.max_open_sockets = 1;
   // 6 KB, nu 4: citirea prin sistemul de fisiere consuma si ea din stiva sarcinii, iar noi mai
   // avem si buffere locale in tratarea cererii. Cu 4 KB eram prea aproape de margine.
-  config.stack_size = 6144;
+  config.stack_size = 5120;
   config.lru_purge_enable = true;
   config.uri_match_fn = httpd_uri_match_wildcard;
 
@@ -279,7 +283,10 @@ void SDCard::start_http_server_() {
   uri.user_ctx = this;
   httpd_register_uri_handler(this->server_, &uri);
 
-  ESP_LOGI(TAG, "Server de fisiere pornit pe portul %u", this->http_port_);
+  ESP_LOGI(TAG, "Server de fisiere pornit pe portul %u. Memorie interna libera: %u octeti "
+                "(cel mai mare bloc: %u).",
+           this->http_port_, (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 }
 
 esp_err_t SDCard::http_handler_(httpd_req_t *request) {
@@ -329,8 +336,10 @@ esp_err_t SDCard::http_handler_(httpd_req_t *request) {
   // Primii 512 KB ii trimitem nefranati: sunt vreo 30 de secunde de muzica pusa deoparte, din
   // care playerul porneste imediat si are din ce trai daca placa se impiedica de ceva.
   static constexpr size_t AVANS = 512 * 1024;
-  ESP_LOGI(TAG, "Trimit %s: %u kbps, franez la %u KB/s dupa primii %u KB.", nume.c_str(), calitate_kbps,
-           (unsigned) (ritm_octeti_pe_sec / 1024), (unsigned) (AVANS / 1024));
+  ESP_LOGI(TAG, "Trimit %s: %u kbps, franez la %u KB/s dupa primii %u KB. Memorie interna "
+                "libera: %u octeti.",
+           nume.c_str(), calitate_kbps, (unsigned) (ritm_octeti_pe_sec / 1024), (unsigned) (AVANS / 1024),
+           (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
   // MASURATOARE (temporara, pentru intreruperi): cronometram separat citirea de pe card si
   // trimiterea catre player. Daca sunetul se rupe, una din cele doua se opreste undeva.
