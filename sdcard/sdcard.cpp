@@ -119,26 +119,36 @@ unsigned mp3_kbps(FILE *fisier) {
   static const uint16_t MPEG1_L3[15] = {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320};
   static const uint16_t MPEG2_L3[15] = {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160};
 
-  uint8_t cap[4096];
-  const size_t citit = fread(cap, 1, sizeof(cap), fisier);
-  fseek(fisier, 0, SEEK_SET);
-  if (citit < 10) {
+  // ATENTIE la marimea buffer-ului de mai jos: functia asta ruleaza pe sarcina serverului web,
+  // care are o stiva de cativa kilobyti. Prima varianta folosea un vector local de 4096 octeti
+  // si depasea stiva - placa se reseta cu "Guru Meditation Error" de fiecare data cand pornea o
+  // melodie. Aici tinem buffer-ul mic dinadins si sarim peste eticheta cu fseek, nu citind-o.
+  uint8_t cap[256];
+
+  if (fread(cap, 1, 10, fisier) != 10) {
+    fseek(fisier, 0, SEEK_SET);
     return 0;
   }
 
-  size_t i = 0;
-  // Sarim peste eticheta ID3v2 de la inceput, daca exista. Marimea ei sta pe 4 octeti in care
-  // se foloseste doar cate 7 biti din fiecare - asa e formatul.
+  long inceput_audio = 0;
+  // Eticheta ID3v2 de la inceput poate avea si sute de kilobyti (coperta albumului). Nu o
+  // citim - ii aflam doar marimea si sarim peste ea. Marimea sta pe 4 octeti din care se
+  // foloseste doar cate 7 biti - asa e formatul.
   if (cap[0] == 'I' && cap[1] == 'D' && cap[2] == '3') {
-    const size_t marime = ((size_t) (cap[6] & 0x7F) << 21) | ((size_t) (cap[7] & 0x7F) << 14) |
-                          ((size_t) (cap[8] & 0x7F) << 7) | (size_t) (cap[9] & 0x7F);
-    i = 10 + marime;
-    if (i >= citit) {
-      return 0;  // eticheta e mai mare decat ce am citit - renuntam la franare
-    }
+    const long marime = ((long) (cap[6] & 0x7F) << 21) | ((long) (cap[7] & 0x7F) << 14) |
+                        ((long) (cap[8] & 0x7F) << 7) | (long) (cap[9] & 0x7F);
+    inceput_audio = 10 + marime;
   }
 
-  for (; i + 3 < citit; i++) {
+  if (fseek(fisier, inceput_audio, SEEK_SET) != 0) {
+    fseek(fisier, 0, SEEK_SET);
+    return 0;
+  }
+
+  const size_t citit = fread(cap, 1, sizeof(cap), fisier);
+  fseek(fisier, 0, SEEK_SET);
+
+  for (size_t i = 0; citit >= 4 && i + 3 < citit; i++) {
     if (cap[i] != 0xFF || (cap[i + 1] & 0xE0) != 0xE0) {
       continue;  // nu e inceput de cadru
     }
@@ -243,7 +253,9 @@ void SDCard::start_http_server_() {
   // Pus pe 1, serverul si decodorul isi impart procesorul in mod egal, pe rand.
   config.task_priority = 1;
   config.max_open_sockets = 2;
-  config.stack_size = 4096;
+  // 6 KB, nu 4: citirea prin sistemul de fisiere consuma si ea din stiva sarcinii, iar noi mai
+  // avem si buffere locale in tratarea cererii. Cu 4 KB eram prea aproape de margine.
+  config.stack_size = 6144;
   config.lru_purge_enable = true;
   config.uri_match_fn = httpd_uri_match_wildcard;
 
