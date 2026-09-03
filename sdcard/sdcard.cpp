@@ -7,6 +7,9 @@
 
 #include "driver/sdmmc_host.h"
 #include "esp_timer.h"
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 
@@ -105,6 +108,49 @@ unsigned kbps(size_t octeti_acum, size_t octeti_la_start, int64_t moment_start_u
   }
   const uint64_t octeti = (uint64_t) (octeti_acum - octeti_la_start);
   return (unsigned) ((octeti * 8ULL * 1000000ULL) / (uint64_t) durata_us / 1000ULL);
+}
+
+/// Calitatea fisierului MP3 (kbps), citita din antetul primului cadru.
+///
+/// De ce ne trebuie: serverul nostru trebuie sa livreze la ritmul muzicii, ca un post de radio,
+/// nu cat de repede poate. Ca sa stie cat inseamna "ritmul muzicii", trebuie sa afle calitatea.
+/// Intoarce 0 daca nu recunoaste antetul; atunci nu franam deloc.
+unsigned mp3_kbps(FILE *fisier) {
+  static const uint16_t MPEG1_L3[15] = {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320};
+  static const uint16_t MPEG2_L3[15] = {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160};
+
+  uint8_t cap[4096];
+  const size_t citit = fread(cap, 1, sizeof(cap), fisier);
+  fseek(fisier, 0, SEEK_SET);
+  if (citit < 10) {
+    return 0;
+  }
+
+  size_t i = 0;
+  // Sarim peste eticheta ID3v2 de la inceput, daca exista. Marimea ei sta pe 4 octeti in care
+  // se foloseste doar cate 7 biti din fiecare - asa e formatul.
+  if (cap[0] == 'I' && cap[1] == 'D' && cap[2] == '3') {
+    const size_t marime = ((size_t) (cap[6] & 0x7F) << 21) | ((size_t) (cap[7] & 0x7F) << 14) |
+                          ((size_t) (cap[8] & 0x7F) << 7) | (size_t) (cap[9] & 0x7F);
+    i = 10 + marime;
+    if (i >= citit) {
+      return 0;  // eticheta e mai mare decat ce am citit - renuntam la franare
+    }
+  }
+
+  for (; i + 3 < citit; i++) {
+    if (cap[i] != 0xFF || (cap[i + 1] & 0xE0) != 0xE0) {
+      continue;  // nu e inceput de cadru
+    }
+    const uint8_t versiune = (cap[i + 1] >> 3) & 0x03;  // 3 = MPEG1, 2 = MPEG2, 0 = MPEG2.5
+    const uint8_t strat = (cap[i + 1] >> 1) & 0x03;     // 1 = Layer III
+    const uint8_t index = (cap[i + 2] >> 4) & 0x0F;
+    if (strat != 1 || versiune == 1 || index == 0 || index == 15) {
+      continue;  // antet fara sens - cautam mai departe
+    }
+    return (versiune == 3) ? MPEG1_L3[index] : MPEG2_L3[index];
+  }
+  return 0;
 }
 
 }  // namespace
@@ -251,6 +297,23 @@ esp_err_t SDCard::http_handler_(httpd_req_t *request) {
   // Tipul trebuie trimis corect: placa se uita la el ca sa stie ce decodor sa foloseasca.
   httpd_resp_set_type(request, mime);
 
+  // FRANA - asta e miezul reparatiei. Fara ea serverul toarna fisierul cat de repede poate, iar
+  // sarcina care citeste nu mai doarme niciodata si se cearta cu decodorul pe procesor (au
+  // aceeasi prioritate). Un post de radio nu face asta: el livreaza la ritmul muzicii, iar
+  // cititorul doarme intre pachete. Aici ne purtam la fel.
+  const unsigned calitate_kbps = mp3_kbps(fisier);
+  // Octeti pe secunda, cu doar 5% peste ritmul real. Marja trebuie sa fie MICA dinadins: daca
+  // livram mult mai repede decat se consuma, rezerva playerului se umple, iar cititorul lui
+  // incepe iar sa se invarta incercand sa bage date intr-un vas plin - exact starea de care
+  // fugim. Cu 5%, rezerva se umple atat de incet incat nu apuca sa se umple pana la finalul
+  // melodiei, iar cititorul sta linistit, asteptand date, ca la radio.
+  const uint32_t ritm_octeti_pe_sec = (calitate_kbps > 0) ? (uint32_t) (calitate_kbps * 1000 / 8 * 21 / 20) : 0;
+  // Primii 512 KB ii trimitem nefranati: sunt vreo 30 de secunde de muzica pusa deoparte, din
+  // care playerul porneste imediat si are din ce trai daca placa se impiedica de ceva.
+  static constexpr size_t AVANS = 512 * 1024;
+  ESP_LOGI(TAG, "Trimit %s: %u kbps, franez la %u KB/s dupa primii %u KB.", nume.c_str(), calitate_kbps,
+           (unsigned) (ritm_octeti_pe_sec / 1024), (unsigned) (AVANS / 1024));
+
   // MASURATOARE (temporara, pentru intreruperi): cronometram separat citirea de pe card si
   // trimiterea catre player. Daca sunetul se rupe, una din cele doua se opreste undeva.
   // Scriem in log doar cand chiar dureaza mult, altfel am ineca consola.
@@ -286,6 +349,23 @@ esp_err_t SDCard::http_handler_(httpd_req_t *request) {
     maxim_retea_us = std::max(maxim_retea_us, retea_us);
     bucati++;
     octeti += citit;
+
+    // FRANA: daca am trimis mai mult decat ii trebuie muzicii pana acum, dormim diferenta.
+    // Somnul asta e tot rostul: cat dormim noi, decodorul are procesorul numai pentru el.
+    if (ritm_octeti_pe_sec > 0 && octeti > AVANS) {
+      const int64_t scurs_ms = (t2 - inceput_us) / 1000;
+      const int64_t cuvenit = (int64_t) AVANS + (int64_t) ritm_octeti_pe_sec * scurs_ms / 1000;
+      if ((int64_t) octeti > cuvenit) {
+        const int64_t exces = (int64_t) octeti - cuvenit;
+        int64_t somn_ms = exces * 1000 / (int64_t) ritm_octeti_pe_sec;
+        if (somn_ms > 500) {
+          somn_ms = 500;  // niciodata mai mult de o jumatate de secunda dintr-o data
+        }
+        if (somn_ms > 0) {
+          vTaskDelay(pdMS_TO_TICKS(somn_ms));
+        }
+      }
+    }
 
     // Dupa 12 secunde consideram ca rezervele s-au umplut si livrarea merge la ritmul muzicii.
     // De aici incolo masuram calitatea reala a fisierului.
