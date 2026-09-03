@@ -87,6 +87,17 @@ std::string decodifica_adresa(const char *text) {
   return iesire;
 }
 
+/// Calitatea fisierului in kbps, dedusa din cati octeti au trecut si in cat timp. Merge pentru
+/// ca trimiterea e franata de player: livram exact cat consuma muzica, nici mai mult, nici mai
+/// putin. Deci "octeti impartit la timp" chiar e ritmul real al melodiei.
+unsigned kbps(size_t octeti, int64_t inceput_us) {
+  const int64_t durata_us = esp_timer_get_time() - inceput_us;
+  if (durata_us < 1000000) {
+    return 0;  // sub o secunda, socoteala n-ar insemna nimic
+  }
+  return (unsigned) ((octeti * 8ULL * 1000000ULL) / (uint64_t) durata_us / 1000ULL);
+}
+
 }  // namespace
 
 void SDCard::setup() {
@@ -224,12 +235,16 @@ esp_err_t SDCard::http_handler_(httpd_req_t *request) {
   // MASURATOARE (temporara, pentru intreruperi): cronometram separat citirea de pe card si
   // trimiterea catre player. Daca sunetul se rupe, una din cele doua se opreste undeva.
   // Scriem in log doar cand chiar dureaza mult, altfel am ineca consola.
-  static constexpr int64_t PRAG_US = 120000;  // 120 ms
-  int64_t total_card_us = 0;
-  int64_t total_retea_us = 0;
+  // Pragul a fost 120 ms, dar masuratoarea ne-a lamurit ca asteptarile de ~1,4 s la trimitere
+  // sunt NORMALE: playerul consuma la ritmul muzicii, iar noi asteptam sa faca loc. Nu e o
+  // blocare, e franare naturala. Ridicat la 2,5 s ca sa iasa in log doar opririle adevarate.
+  static constexpr int64_t PRAG_US = 2500000;  // 2,5 s
   int64_t maxim_card_us = 0;
   int64_t maxim_retea_us = 0;
   uint32_t bucati = 0;
+
+  const int64_t inceput_us = esp_timer_get_time();
+  size_t octeti = 0;
 
   size_t citit;
   while (true) {
@@ -245,11 +260,10 @@ esp_err_t SDCard::http_handler_(httpd_req_t *request) {
 
     const int64_t card_us = t1 - t0;
     const int64_t retea_us = t2 - t1;
-    total_card_us += card_us;
-    total_retea_us += retea_us;
     maxim_card_us = std::max(maxim_card_us, card_us);
     maxim_retea_us = std::max(maxim_retea_us, retea_us);
     bucati++;
+    octeti += citit;
 
     if (card_us > PRAG_US || retea_us > PRAG_US) {
       ESP_LOGW(TAG, "Bucata %u: cititul de pe card %lld ms, trimiterea %lld ms", (unsigned) bucati,
@@ -259,19 +273,24 @@ esp_err_t SDCard::http_handler_(httpd_req_t *request) {
     if (trimis != ESP_OK) {
       // Playerul a inchis legatura (ai schimbat melodia, de exemplu) - nu e o eroare.
       fclose(fisier);
-      ESP_LOGI(TAG, "Oprit dupa %u bucati. Card: %lld ms total, cel mai lung %lld ms. "
-                    "Trimitere: %lld ms total, cea mai lunga %lld ms.",
-               (unsigned) bucati, (long long) (total_card_us / 1000), (long long) (maxim_card_us / 1000),
-               (long long) (total_retea_us / 1000), (long long) (maxim_retea_us / 1000));
+      ESP_LOGI(TAG, "Oprit dupa %u bucati (%u KB). Card: cel mai lung %lld ms. "
+                    "Trimitere: cea mai lunga %lld ms. Calitatea fisierului: ~%u kbps.",
+               (unsigned) bucati, (unsigned) (octeti / 1024), (long long) (maxim_card_us / 1000),
+               (long long) (maxim_retea_us / 1000), kbps(octeti, inceput_us));
       return ESP_FAIL;
     }
   }
   fclose(fisier);
 
-  ESP_LOGI(TAG, "Fisier terminat: %u bucati. Card: %lld ms total, cel mai lung %lld ms. "
-                "Trimitere: %lld ms total, cea mai lunga %lld ms.",
-           (unsigned) bucati, (long long) (total_card_us / 1000), (long long) (maxim_card_us / 1000),
-           (long long) (total_retea_us / 1000), (long long) (maxim_retea_us / 1000));
+  const unsigned calitate = kbps(octeti, inceput_us);
+  ESP_LOGI(TAG, "Fisier terminat: %u bucati (%u KB). Card: cel mai lung %lld ms. "
+                "Trimitere: cea mai lunga %lld ms. Calitatea fisierului: ~%u kbps.",
+           (unsigned) bucati, (unsigned) (octeti / 1024), (long long) (maxim_card_us / 1000),
+           (long long) (maxim_retea_us / 1000), calitate);
+  if (calitate > 200) {
+    ESP_LOGW(TAG, "Peste 200 kbps - placa are de tras si sunetul se poate rupe. "
+                  "Sub 192 kbps merge curat.");
+  }
 
   // Bucata de lungime zero inseamna "am terminat".
   httpd_resp_send_chunk(request, nullptr, 0);
