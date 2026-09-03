@@ -87,14 +87,23 @@ std::string decodifica_adresa(const char *text) {
   return iesire;
 }
 
-/// Calitatea fisierului in kbps, dedusa din cati octeti au trecut si in cat timp. Merge pentru
-/// ca trimiterea e franata de player: livram exact cat consuma muzica, nici mai mult, nici mai
-/// putin. Deci "octeti impartit la timp" chiar e ritmul real al melodiei.
-unsigned kbps(size_t octeti, int64_t inceput_us) {
-  const int64_t durata_us = esp_timer_get_time() - inceput_us;
-  if (durata_us < 1000000) {
-    return 0;  // sub o secunda, socoteala n-ar insemna nimic
+/// Calitatea fisierului in kbps.
+///
+/// ATENTIE, aici gresisem prima data: la inceputul redarii serverul NU e franat de player, ci
+/// toarna cat poate de repede ca sa umple rezervele. Socotind de la secunda zero ieseau cifre
+/// imposibile - 844 kbps pentru un MP3, ceea ce nu exista. Abia dupa ce rezervele s-au umplut
+/// livrarea se aseaza la ritmul real al muzicii.
+/// De-aia masuram doar din momentul in care lucrurile s-au linistit, si returnam 0 cat timp nu
+/// avem inca o bucata de timp asezata destul de lunga ca sa insemne ceva.
+unsigned kbps(size_t octeti_acum, size_t octeti_la_start, int64_t moment_start_us) {
+  if (moment_start_us == 0) {
+    return 0;  // n-am apucat sa intram in regim asezat
   }
+  const int64_t durata_us = esp_timer_get_time() - moment_start_us;
+  if (durata_us < 10000000) {
+    return 0;  // sub 10 secunde de regim asezat, socoteala inca minte
+  }
+  const uint64_t octeti = (uint64_t) (octeti_acum - octeti_la_start);
   return (unsigned) ((octeti * 8ULL * 1000000ULL) / (uint64_t) durata_us / 1000ULL);
 }
 
@@ -245,6 +254,9 @@ esp_err_t SDCard::http_handler_(httpd_req_t *request) {
 
   const int64_t inceput_us = esp_timer_get_time();
   size_t octeti = 0;
+  // Momentul si numarul de octeti de la care incepe regimul asezat (dupa umplerea rezervelor).
+  int64_t asezat_us = 0;
+  size_t asezat_octeti = 0;
 
   size_t citit;
   while (true) {
@@ -265,6 +277,13 @@ esp_err_t SDCard::http_handler_(httpd_req_t *request) {
     bucati++;
     octeti += citit;
 
+    // Dupa 12 secunde consideram ca rezervele s-au umplut si livrarea merge la ritmul muzicii.
+    // De aici incolo masuram calitatea reala a fisierului.
+    if (asezat_us == 0 && (t2 - inceput_us) > 12000000) {
+      asezat_us = t2;
+      asezat_octeti = octeti;
+    }
+
     if (card_us > PRAG_US || retea_us > PRAG_US) {
       ESP_LOGW(TAG, "Bucata %u: cititul de pe card %lld ms, trimiterea %lld ms", (unsigned) bucati,
                (long long) (card_us / 1000), (long long) (retea_us / 1000));
@@ -274,17 +293,18 @@ esp_err_t SDCard::http_handler_(httpd_req_t *request) {
       // Playerul a inchis legatura (ai schimbat melodia, de exemplu) - nu e o eroare.
       fclose(fisier);
       ESP_LOGI(TAG, "Oprit dupa %u bucati (%u KB). Card: cel mai lung %lld ms. "
-                    "Trimitere: cea mai lunga %lld ms. Calitatea fisierului: ~%u kbps.",
+                    "Trimitere: cea mai lunga %lld ms. Calitate: ~%u kbps (0 = prea scurt "
+                    "ca sa pot masura; lasa melodia sa cante 25 de secunde).",
                (unsigned) bucati, (unsigned) (octeti / 1024), (long long) (maxim_card_us / 1000),
-               (long long) (maxim_retea_us / 1000), kbps(octeti, inceput_us));
+               (long long) (maxim_retea_us / 1000), kbps(octeti, asezat_octeti, asezat_us));
       return ESP_FAIL;
     }
   }
   fclose(fisier);
 
-  const unsigned calitate = kbps(octeti, inceput_us);
+  const unsigned calitate = kbps(octeti, asezat_octeti, asezat_us);
   ESP_LOGI(TAG, "Fisier terminat: %u bucati (%u KB). Card: cel mai lung %lld ms. "
-                "Trimitere: cea mai lunga %lld ms. Calitatea fisierului: ~%u kbps.",
+                "Trimitere: cea mai lunga %lld ms. Calitate: ~%u kbps (0 = prea scurt).",
            (unsigned) bucati, (unsigned) (octeti / 1024), (long long) (maxim_card_us / 1000),
            (long long) (maxim_retea_us / 1000), calitate);
   if (calitate > 200) {
