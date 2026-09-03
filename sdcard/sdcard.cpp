@@ -19,9 +19,11 @@ namespace esphome::sdcard {
 
 static const char *const TAG = "sdcard";
 
-// Cat citim din card dintr-o data. 4 KB e un compromis: mai mic inseamna prea multe accese la
-// card, mai mare ar manca din memoria interna care oricum e pe terminate.
-static constexpr size_t BUFFER_SIZE = 4096;
+// Cat citim din card dintr-o data. Marit de la 4 KB la 16 KB dupa ce s-au auzit intreruperi:
+// citirile mari inseamna mai putine drumuri la card si mai putine bucati trimise, deci mai
+// putine ocazii ca rezerva de sunet sa se goleasca intre doua citiri. Nu ne costa memorie
+// interna - rezerva se cere din PSRAM.
+static constexpr size_t BUFFER_SIZE = 16384;
 static constexpr size_t MAX_TRACKS = 200;
 
 namespace {
@@ -143,8 +145,16 @@ void SDCard::start_http_server_() {
 
   // Rezerva de citire o cerem intai din memoria externa (PSRAM), ca sa nu consumam din cea
   // interna, care e la 74%. Daca nu e PSRAM, se ia din cea interna.
-  RAMAllocator<uint8_t> allocator;
+  RAMAllocator<uint8_t> allocator{RAMAllocator<uint8_t>::ALLOC_EXTERNAL};
   this->buffer_ = allocator.allocate(BUFFER_SIZE);
+  if (this->buffer_ == nullptr) {
+    // Fara PSRAM disponibila, incercam si memoria interna - dar cu o rezerva mai mica.
+    RAMAllocator<uint8_t> intern{RAMAllocator<uint8_t>::ALLOC_INTERNAL};
+    this->buffer_ = intern.allocate(4096);
+    this->buffer_size_ = 4096;
+  } else {
+    this->buffer_size_ = BUFFER_SIZE;
+  }
   if (this->buffer_ == nullptr) {
     ESP_LOGE(TAG, "Nu am memorie pentru rezerva de citire - serverul nu porneste.");
     return;
@@ -211,7 +221,7 @@ esp_err_t SDCard::http_handler_(httpd_req_t *request) {
   httpd_resp_set_type(request, mime);
 
   size_t citit;
-  while ((citit = fread(self->buffer_, 1, BUFFER_SIZE, fisier)) > 0) {
+  while ((citit = fread(self->buffer_, 1, self->buffer_size_, fisier)) > 0) {
     if (httpd_resp_send_chunk(request, (const char *) self->buffer_, citit) != ESP_OK) {
       // Playerul a inchis legatura (ai schimbat melodia, de exemplu) - nu e o eroare.
       fclose(fisier);
