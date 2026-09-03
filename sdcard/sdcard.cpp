@@ -322,8 +322,27 @@ esp_err_t SDCard::http_handler_(httpd_req_t *request) {
     return ESP_FAIL;
   }
 
-  // Tipul trebuie trimis corect: placa se uita la el ca sa stie ce decodor sa foloseasca.
-  httpd_resp_set_type(request, mime);
+  // ANTET SCRIS DE MANA, ca al unui post de radio.
+  //
+  // Pana acum foloseam metoda obisnuita a serverului, care imparte raspunsul in bucati, fiecare
+  // cu mărimea ei scrisa inainte ("chunked"). Un post de radio nu face asa: trimite un suvoi
+  // continuu de octeti, fara sa spuna niciodata cat e de lung, pana inchide legatura. Ambele
+  // sunt HTTP corect, dar clientul le trateaza diferit - iar clientul e codul ESPHome, pe care
+  // nu-l putem schimba. Aici ne purtam exact ca un post de radio.
+  {
+    char antet[200];
+    const int lungime = snprintf(antet, sizeof(antet),
+                                 "HTTP/1.1 200 OK\r\n"
+                                 "Content-Type: %s\r\n"
+                                 "Connection: close\r\n"
+                                 "Cache-Control: no-cache\r\n"
+                                 "\r\n",
+                                 mime);
+    if (lungime <= 0 || httpd_send(request, antet, lungime) < 0) {
+      fclose(fisier);
+      return ESP_FAIL;
+    }
+  }
 
   // FRANA - asta e miezul reparatiei. Fara ea serverul toarna fisierul cat de repede poate, iar
   // sarcina care citeste nu mai doarme niciodata si se cearta cu decodorul pe procesor (au
@@ -413,7 +432,9 @@ esp_err_t SDCard::http_handler_(httpd_req_t *request) {
       break;
     }
 
-    esp_err_t trimis = httpd_resp_send_chunk(request, (const char *) de_trimis, citit);
+    // Trimitem octetii bruti, fara nicio impachetare - exact ca un post de radio.
+    const int rezultat = httpd_send(request, (const char *) de_trimis, citit);
+    const esp_err_t trimis = (rezultat == (int) citit) ? ESP_OK : ESP_FAIL;
     int64_t t2 = esp_timer_get_time();
 
     const int64_t card_us = t1 - t0;
@@ -481,8 +502,9 @@ esp_err_t SDCard::http_handler_(httpd_req_t *request) {
                   "Sub 192 kbps merge curat.");
   }
 
-  // Bucata de lungime zero inseamna "am terminat".
-  httpd_resp_send_chunk(request, nullptr, 0);
+  // Fara impachetare nu exista "bucata de lungime zero" - sfarsitul se anunta inchizand
+  // legatura, exact cum face un post de radio cand se termina emisiunea.
+  httpd_sess_trigger_close(request->handle, httpd_req_to_sockfd(request));
   return ESP_OK;
 }
 
