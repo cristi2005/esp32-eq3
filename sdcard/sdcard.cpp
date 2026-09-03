@@ -186,6 +186,16 @@ void SDCard::start_http_server_() {
   // ATENTIE: pagina web a placii foloseste deja portul de control implicit (32768). Doua
   // servere cu acelasi port de control nu pornesc - de-aia il mutam pe al nostru.
   config.ctrl_port = 32769;
+  // PRIORITATEA - aici era buba, si e cel mai important rand din tot fisierul.
+  // Serverul web al ESP-IDF porneste implicit cu prioritatea 5. Dar decodorul de MP3 al
+  // ESPHome (cel care trebuie sa tina pasul cu muzica, fara nicio pauza) ruleaza cu
+  // prioritatea 1 - verificat in speaker_media_player.cpp, MEDIA_PIPELINE_TASK_PRIORITY = 1.
+  // Adica serverul nostru era de cinci ori mai important decat decodorul si il dadea la o
+  // parte de fiecare data cand avea ceva de trimis, adica tot timpul. De-aia radioul mergea
+  // curat (datele vin din afara, nu exista niciun server pe placa) si de-aia n-a ajutat nimic
+  // din ce am oprit: egalizator, leduri, pagina web - toate stau si ele pe prioritate mica.
+  // Pus pe 1, serverul si decodorul isi impart procesorul in mod egal, pe rand.
+  config.task_priority = 1;
   config.max_open_sockets = 2;
   config.stack_size = 4096;
   config.lru_purge_enable = true;
