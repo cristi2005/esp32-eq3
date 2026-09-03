@@ -24,12 +24,9 @@ namespace esphome::sdcard {
 
 static const char *const TAG = "sdcard";
 
-// Cat citim din card dintr-o data. 8 KB, si OBLIGATORIU din memoria interna - vezi mai jos de ce.
+// Cat citim din card dintr-o data. 4 KB, si OBLIGATORIU din memoria interna - vezi mai jos de ce.
 static constexpr size_t BUFFER_SIZE = 4096;
 static constexpr size_t MAX_TRACKS = 200;
-// Cat de mare poate fi un fisier ca sa il tinem intreg in memoria externa. 2 MB inseamna vreo
-// doua minute de muzica la 128 kbps - destul cat sa ne lamurim daca cardul e vinovat.
-static constexpr size_t PREINCARCARE_MAXIM = 2 * 1024 * 1024;
 
 namespace {
 
@@ -221,7 +218,8 @@ void SDCard::start_http_server_() {
     return;
   }
 
-  // AICI ERA CAUZA INTRERUPERILOR, si e scrisa in documentatia Espressif despre driverul de card.
+  // AICI ERA (O PARTE DIN) CAUZA INTRERUPERILOR, si e scrisa in documentatia Espressif despre
+  // driverul de card.
   //
   // Cititorul de card nu poate scrie direct in memoria externa (PSRAM) - acolo nu ajunge canalul
   // lui de transfer direct. Cand ii dai o rezerva din PSRAM, driverul nu refuza: se descurca
@@ -363,39 +361,22 @@ esp_err_t SDCard::http_handler_(httpd_req_t *request) {
            nume.c_str(), calitate_kbps, (unsigned) (ritm_octeti_pe_sec / 1024), (unsigned) (AVANS / 1024),
            (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
-  // --- TEST: PREINCARCARE IN MEMORIA EXTERNA ---
-  // Daca fisierul incape, il citim ACUM in intregime in PSRAM si il trimitem de acolo. In timpul
-  // redarii nu mai atingem cardul deloc. Daca asa se aude curat, vinovat e cardul; daca tot se
-  // rupe, cardul e nevinovat si problema e in alta parte. Fisierele prea mari raman citite pe
-  // bucati, ca pana acum - vezi in log care varianta s-a folosit.
-  uint8_t *tot_fisierul = nullptr;
-  size_t marime_fisier = 0;
-  if (fseek(fisier, 0, SEEK_END) == 0) {
-    const long capat = ftell(fisier);
-    fseek(fisier, 0, SEEK_SET);
-    if (capat > 0 && (size_t) capat <= PREINCARCARE_MAXIM) {
-      tot_fisierul = (uint8_t *) heap_caps_malloc((size_t) capat, MALLOC_CAP_SPIRAM);
-      if (tot_fisierul != nullptr) {
-        const int64_t t_inc = esp_timer_get_time();
-        marime_fisier = fread(tot_fisierul, 1, (size_t) capat, fisier);
-        if (marime_fisier != (size_t) capat) {
-          heap_caps_free(tot_fisierul);
-          tot_fisierul = nullptr;
-          marime_fisier = 0;
-          ESP_LOGW(TAG, "Preincarcarea nu a reusit - citim pe bucati, ca pana acum.");
-        } else {
-          ESP_LOGI(TAG, "PREINCARCAT in memoria externa: %u KB in %lld ms. Cardul nu mai e atins "
-                        "cat cantă melodia.",
-                   (unsigned) (marime_fisier / 1024), (long long) ((esp_timer_get_time() - t_inc) / 1000));
-        }
-      } else {
-        ESP_LOGW(TAG, "Nu incape in memoria externa (%ld KB) - citim pe bucati.", capat / 1024);
-      }
-    } else {
-      ESP_LOGI(TAG, "Fisier prea mare pentru preincarcare (%ld KB) - citim pe bucati.", capat / 1024);
-    }
-  }
-  size_t pozitie = 0;
+  // AICI ERA CEALALTA JUMATATE A PROBLEMEI (cea care mai ramasese dupa reparatia de mai sus).
+  //
+  // Pana acum, fisierele sub 2 MB erau citite dintr-o data, in intregime, intr-un buffer din
+  // memoria EXTERNA (PSRAM), cu un singur fread(). Asta insemna exact aceeasi boala descrisa
+  // mai sus - driverul de card copia acel buffer mare tot bloc-cu-bloc de 512 octeti, la fel
+  // de incet ca inainte de reparatie. Preincarcarea dura pana la 2-3 secunde, si dura DUPA ce
+  // antetul HTTP era deja trimis catre player - adica playerul stia ca melodia incepe, dar nu
+  // primea niciun octet de muzica pana se termina preincarcarea. Exact in fereastra aia se
+  // rupea sunetul, la fiecare schimbare de melodie - de-aia se auzea "cate putin, la unele
+  // melodii mai mult, la altele mai putin": depindea de cat de aproape era fisierul de pragul
+  // de 2 MB, deci de cat dura preincarcarea lui.
+  //
+  // Preincarcarea a fost utila doar ca test, ca sa dovedim ca vina nu era a cardului - lucru
+  // dovedit deja. Acum ca citirea pe bucati foloseste memoria interna (rapida), nu mai are
+  // niciun rost sa o pastram, asa ca am scos-o de tot: citim direct pe bucati, ca la radio.
+  size_t octeti = 0;
 
   // MASURATOARE (temporara, pentru intreruperi): cronometram separat citirea de pe card si
   // trimiterea catre player. Daca sunetul se rupe, una din cele doua se opreste undeva.
@@ -409,7 +390,6 @@ esp_err_t SDCard::http_handler_(httpd_req_t *request) {
   uint32_t bucati = 0;
 
   const int64_t inceput_us = esp_timer_get_time();
-  size_t octeti = 0;
   // Momentul si numarul de octeti de la care incepe regimul asezat (dupa umplerea rezervelor).
   int64_t asezat_us = 0;
   size_t asezat_octeti = 0;
@@ -417,23 +397,14 @@ esp_err_t SDCard::http_handler_(httpd_req_t *request) {
   size_t citit;
   while (true) {
     int64_t t0 = esp_timer_get_time();
-    const uint8_t *de_trimis;
-    if (tot_fisierul != nullptr) {
-      // Din memorie: nicio atingere a cardului.
-      citit = std::min(self->buffer_size_, marime_fisier - pozitie);
-      de_trimis = tot_fisierul + pozitie;
-      pozitie += citit;
-    } else {
-      citit = fread(self->buffer_, 1, self->buffer_size_, fisier);
-      de_trimis = self->buffer_;
-    }
+    citit = fread(self->buffer_, 1, self->buffer_size_, fisier);
     int64_t t1 = esp_timer_get_time();
     if (citit == 0) {
       break;
     }
 
     // Trimitem octetii bruti, fara nicio impachetare - exact ca un post de radio.
-    const int rezultat = httpd_send(request, (const char *) de_trimis, citit);
+    const int rezultat = httpd_send(request, (const char *) self->buffer_, citit);
     const esp_err_t trimis = (rezultat == (int) citit) ? ESP_OK : ESP_FAIL;
     int64_t t2 = esp_timer_get_time();
 
@@ -476,9 +447,6 @@ esp_err_t SDCard::http_handler_(httpd_req_t *request) {
     if (trimis != ESP_OK) {
       // Playerul a inchis legatura (ai schimbat melodia, de exemplu) - nu e o eroare.
       fclose(fisier);
-      if (tot_fisierul != nullptr) {
-        heap_caps_free(tot_fisierul);
-      }
       ESP_LOGI(TAG, "Oprit dupa %u bucati (%u KB). Card: cel mai lung %lld ms. "
                     "Trimitere: cea mai lunga %lld ms. Calitate: ~%u kbps (0 = prea scurt "
                     "ca sa pot masura; lasa melodia sa cante 25 de secunde).",
@@ -488,9 +456,6 @@ esp_err_t SDCard::http_handler_(httpd_req_t *request) {
     }
   }
   fclose(fisier);
-  if (tot_fisierul != nullptr) {
-    heap_caps_free(tot_fisierul);
-  }
 
   const unsigned calitate = kbps(octeti, asezat_octeti, asezat_us);
   ESP_LOGI(TAG, "Fisier terminat: %u bucati (%u KB). Card: cel mai lung %lld ms. "
