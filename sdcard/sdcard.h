@@ -11,19 +11,15 @@
 
 namespace esphome::sdcard {
 
-// Monteaza cardul SD (mod 1 fir) si porneste un server web care serveste fisierele de pe el.
-// Playerul obisnuit le cere apoi ca pe un post de radio, prin http://127.0.0.1:<port>/<fisier>.
+// Monteaza cardul SD (mod 1 fir) si porneste, LA CERERE, un server web care serveste
+// fisierele de pe el. Playerul obisnuit le cere apoi ca pe un post de radio, prin
+// http://127.0.0.1:<port>/<fisier>.
 class SDCard : public Component {
  public:
   // DATA: cardul trebuie montat devreme, ca sa fie gata cand alte componente il cauta.
   float get_setup_priority() const override { return setup_priority::DATA; }
 
   void setup() override;
-  // Serverul web NU se poate porni din setup(): componenta noastra ruleaza cu prioritatea DATA
-  // (600), iar WiFi-ul abia cu 250 - adica DUPA noi. Pornit inainte ca reteaua sa existe,
-  // serverul incearca sa deschida socket-uri intr-o stiva neinitializata si placa se reseteaza.
-  // In loop() suntem siguri ca tot setup-ul s-a terminat, retea inclusa.
-  void loop() override;
   void dump_config() override;
 
   void set_mount_point(const std::string &mount_point) { this->mount_point_ = mount_point; }
@@ -52,16 +48,31 @@ class SDCard : public Component {
   /// @brief Adresa completa pe care i-o dai playerului. Sir gol daca indexul e gresit.
   std::string track_url(int index) const;
 
-  /// @brief Inchide imediat, din afara, orice transfer de fisier ramas activ pe server.
-  ///
-  /// De ce ne trebuie: cand utilizatorul trece de pe card pe alta sursa (radio sau Bluetooth),
-  /// playerul deschide o conexiune noua, dar noi aflam ca cea veche s-a inchis abia la
-  /// urmatoarea incercare de trimitere - uneori la cateva secunde distanta. Pana atunci, sarcina
-  /// serverului nostru (cu bufferul si stiva ei, memorie interna DMA) ramane alocata exact cand
-  /// noua sursa are nevoie sa-si realoce propriile bufere DMA pentru difuzor - cele doua se pot
-  /// calca pe picioare. Aici inchidem noi conexiunea, dinadins, inainte sa apuce sa se ceara.
-  /// Nu face nimic daca nu exista niciun transfer activ.
+  /// @brief Porneste serverul de fisiere daca nu ruleaza deja. Apeleaz-o inainte de a cere
+  /// prima adresa de melodie intr-o sesiune de ascultare - vezi motivul la stop_server().
+  /// Nu face nimic daca serverul ruleaza deja.
+  void ensure_server_started();
+
+  /// @brief Inchide imediat, din afara, orice transfer de fisier ramas activ pe server, dar
+  /// LASA serverul pornit. Foloseste-o cand treci de la o melodie la alta, ca sa nu ramana
+  /// doua transferuri deschise deodata. Nu face nimic daca nu exista niciun transfer activ.
   void stop_transfer();
+
+  /// @brief Opreste TOT serverul de fisiere (inclusiv conexiunea activa, daca exista) si
+  /// elibereaza memoria lui - bufferul de citire si stiva sarcinii web, cateva mii de octeti
+  /// din memoria interna, cea mai rara resursa a placii.
+  ///
+  /// De ce ne trebuie: serverul pornea automat la boot si ramanea alocat cat placa era
+  /// pornita, chiar daca nu se asculta nimic de pe card. Placa are un bug mai vechi si deja
+  /// cunoscut - la schimbarea intre surse cu frecvente de esantionare diferite, difuzorul isi
+  /// reface pe scurt canalul I2S, ceea ce cere si el o bucata de memorie DMA. Cat timp
+  /// serverul cardului statea mereu alocat, acea reconfigurare avea mai putina memorie la
+  /// dispozitie decat inainte de a exista suportul pentru card - iar uneori nu mai gasea loc
+  /// deloc si placa se bloca/repornea. Apeland stop_server() ori de cate ori pleci de pe
+  /// sursa card (spre radio sau Bluetooth) si ensure_server_started() cand te intorci la ea,
+  /// memoria e libera exact atunci cand difuzorul are mai multa nevoie de ea - la radio/BT,
+  /// unde cardul nu are ce cauta oricum. Nu face nimic daca serverul nu ruleaza.
+  void stop_server();
 
  protected:
   void start_http_server_();
