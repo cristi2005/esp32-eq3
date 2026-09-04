@@ -50,7 +50,17 @@ class SDCard : public Component {
   /// fisier poate sa nu incapa chiar daca suma bucatilor libere ar ajunge, daca memoria e
   /// fragmentata. Gandita sa fie chemata INAINTE sa oprim redarea curenta (vezi schimba_melodie
   /// din YAML), ca sa nu taiem sunetul degeaba pentru o melodie care oricum nu are cum sa incapa.
+  ///
+  /// Marja de siguranta folosita difera dupa cum a mai cantat ceva prin placa in sesiunea asta
+  /// (radio, Bluetooth sau o alta melodie) - vezi note_playback_active() si comentariul de la
+  /// PIPELINE_OVERHEAD_ACTIV din .cpp pentru explicatia completa.
   bool track_fits(int index) const;
+
+  /// @brief Anunta cardul ca ceva a INCEPUT sa cante prin placa - radio, Bluetooth sau o melodie
+  /// de pe card (chemata automat de load_track() la succes; scriptul YAML o cheama explicit si
+  /// pentru radio/Bluetooth). Foloseste doar pentru track_fits() - vezi acolo. Sigur de chemat
+  /// oricat de des.
+  void note_playback_active() { this->a_redat_ceva_ = true; }
 
   /// @brief Citeste melodia de la indexul dat, INTEGRAL, de pe card in memoria externa (PSRAM),
   /// si intoarce un audio::AudioFile gata de dat direct la media_player-ul de tip "speaker"
@@ -95,6 +105,10 @@ class SDCard : public Component {
   // fiecare melodie sa poata folosi tot bugetul disponibil.
   uint8_t *buffer_curent_{nullptr};
   audio::AudioFile fisier_curent_{};
+
+  // Vezi note_playback_active() si track_fits() - tine minte daca a mai cantat ceva prin placa
+  // in sesiunea asta (de la ultimul boot), ca sa alegem marja de siguranta potrivita.
+  bool a_redat_ceva_{false};
 };
 
 }  // namespace esphome::sdcard
