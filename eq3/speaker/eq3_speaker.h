@@ -80,6 +80,18 @@ class EQ3Speaker final : public Component, public speaker::Speaker {
     return this->rms_level_[channel < EQ3_MAX_CHANNELS ? channel : 0];
   }
 
+  /// @brief Zeroes both VU-meter values immediately, without touching playback state (unlike stop(),
+  /// which also stops output_speaker_ - the physical output). Call this the moment a source is about
+  /// to be switched (before its replacement starts), so a VU meter reading these values goes dark
+  /// right away instead of holding the last playing level frozen until the new source's audio starts
+  /// flowing through play() again.
+  void reset_levels() {
+    for (uint8_t ch = 0; ch < EQ3_MAX_CHANNELS; ch++) {
+      this->level_[ch] = 0.0f;
+      this->rms_level_[ch] = 0.0f;
+    }
+  }
+
  protected:
   void update_bass_coeffs_();
   void update_mid_coeffs_();
