@@ -2,141 +2,208 @@
 
 #ifdef USE_ESP32
 
+#include "esphome/core/component.h"
 #include "esphome/components/audio/audio.h"
+#include "esphome/components/audio/audio_decoder.h"
+#include "esphome/components/ring_buffer/ring_buffer.h"
 #include "esphome/components/speaker/speaker.h"
 
-#include "esphome/core/component.h"
-
-#include <freertos/FreeRTOS.h>
-
+#include <atomic>
+#include <cstdio>
 #include <memory>
+#include <string>
+#include <vector>
 
-namespace esphome::eq3 {
+namespace esphome::sdcard {
 
-// One IIR biquad section's coefficients (a0 already normalized to 1, so only b0..b2/a1/a2 are stored).
-struct BiquadCoeffs {
-  float b0{1.0f}, b1{0.0f}, b2{0.0f}, a1{0.0f}, a2{0.0f};
-};
-
-// A biquad section's running state (Direct Form I), one instance needed per audio channel.
-struct BiquadState {
-  float x1{0.0f}, x2{0.0f}, y1{0.0f}, y2{0.0f};
-};
-
-static const uint8_t EQ3_MAX_CHANNELS = 2;
-
-// A 3-band (bass/mid/treble) software equalizer speaker. Sits between an upstream source (whatever
-// calls play() on it - e.g. the mixer) and a downstream output_speaker (e.g. the physical I2S speaker):
-// it applies a cascade of 3 biquad filters (low shelf, peaking bell, high shelf) to every sample before
-// forwarding it, without changing the sample format.
-class EQ3Speaker final : public Component, public speaker::Speaker {
+// Monteaza cardul SD (mod 1 fir) si citeste melodiile de pe el, integral, in memoria externa
+// (PSRAM), la cerere - vezi load_track(). NU mai exista niciun server web: fisierul citit e dat
+// DIRECT playerului prin SpeakerMediaPlayer::play_file(), aceeasi metoda publica pe care o
+// foloseste si componenta oficiala "audio_file" a ESPHome-ului pentru sunete din firmware.
+class SDCard : public Component {
  public:
-  float get_setup_priority() const override { return esphome::setup_priority::DATA; }
-  void dump_config() override;
+  // DATA: cardul trebuie montat devreme, ca sa fie gata cand alte componente il cauta.
+  float get_setup_priority() const override { return setup_priority::DATA; }
+
   void setup() override;
-  void loop() override;
+  void dump_config() override;
 
-  size_t play(const uint8_t *data, size_t length, TickType_t ticks_to_wait) override;
-  size_t play(const uint8_t *data, size_t length) override { return this->play(data, length, 0); }
+  void set_mount_point(const std::string &mount_point) { this->mount_point_ = mount_point; }
+  void set_music_folder(const std::string &music_folder) { this->music_folder_ = music_folder; }
+  /// @brief Speakerul-sursa (din YAML, ex: "sursa_muzica") catre care play_track_streaming() va
+  /// trimite DIRECT sunetul decodat, bucata cu bucata - vezi comentariul mare de la
+  /// play_track_streaming() mai jos.
+  void set_speaker(speaker::Speaker *spk) { this->speaker_ = spk; }
 
-  void start() override;
-  void stop() override;
-  void finish() override;
+  bool is_mounted() const { return this->mounted_; }
 
-  void set_pause_state(bool pause_state) override { this->output_speaker_->set_pause_state(pause_state); }
-  bool get_pause_state() const override { return this->output_speaker_->get_pause_state(); }
+  /// @brief Scrie in log tot ce gaseste in folderul dat (maxim 100 de intrari).
+  void list_files(const std::string &path);
 
-  bool has_buffered_data() const override { return this->output_speaker_->has_buffered_data(); }
+  /// @brief Reciteste folderul de muzica si reface lista de melodii. Apeleaz-o dupa ce ai
+  /// copiat fisiere noi pe card fara sa repornesti placa. Scrie in log doar numarul gasit.
+  void scan_music();
 
-  /// @brief Mute state changes are passed to the output speaker.
-  void set_mute_state(bool mute_state) override;
-  bool get_mute_state() override { return this->output_speaker_->get_mute_state(); }
+  /// @brief Scrie in log lista completa de melodii. Separata de scan_music dinadins: in setup()
+  /// zeci de linii de log una dupa alta ingroapa consola si ascund ce e important.
+  void log_tracks();
 
-  /// @brief Volume state changes are passed to the output speaker.
-  void set_volume(float volume) override;
-  float get_volume() override { return this->output_speaker_->get_volume(); }
+  /// @brief Cate melodii sunt in lista.
+  int track_count() const { return (int) this->tracks_.size(); }
 
-  void set_output_speaker(speaker::Speaker *speaker) { this->output_speaker_ = speaker; }
+  /// @brief Numele melodiei (fara cale), pentru afisat. Sir gol daca indexul e gresit.
+  std::string track_name(int index) const;
 
-  /// @brief Sets the bass (low shelf, ~300 Hz) gain in dB (-12..+12) and recomputes its coefficients.
-  void set_bass_gain_db(float gain_db);
-  /// @brief Sets the mid (peaking bell, ~1 kHz) gain in dB (-12..+12) and recomputes its coefficients.
-  void set_mid_gain_db(float gain_db);
-  /// @brief Sets the treble (high shelf, ~3 kHz) gain in dB (-12..+12) and recomputes its coefficients.
-  void set_treble_gain_db(float gain_db);
+  /// @brief Spune daca melodia de la indexul dat ar incapea in memoria externa DUPA ce am
+  /// elibera bufferul curent (daca exista) - o verificare ieftina (doar marimea fisierului pe
+  /// disc, fara sa il citim). Foloseste cel mai mare bloc CONTINUU liber, nu doar totalul - un
+  /// fisier poate sa nu incapa chiar daca suma bucatilor libere ar ajunge, daca memoria e
+  /// fragmentata. Gandita sa fie chemata INAINTE sa oprim redarea curenta (vezi schimba_melodie
+  /// din YAML), ca sa nu taiem sunetul degeaba pentru o melodie care oricum nu are cum sa incapa.
+  ///
+  /// Marja de siguranta folosita difera dupa cum a mai cantat ceva prin placa in sesiunea asta
+  /// (radio, Bluetooth sau o alta melodie) - vezi note_playback_active() si comentariul de la
+  /// PIPELINE_OVERHEAD_ACTIV din .cpp pentru explicatia completa.
+  bool track_fits(int index) const;
 
-  /// @brief Loudest sample of the most recently filtered block for one channel, in [0, 1].
-  /// @param channel 0 = left, 1 = right. A mono stream reports the same value on both.
-  /// Written from the audio task inside play() and read from the main loop (e.g. to drive a VU
-  /// meter), so these are plain 32-bit floats - reads and writes of one are atomic on this chip,
-  /// and a stale value for one block is harmless for a level display.
-  float get_level(uint8_t channel = 0) const { return this->level_[channel < EQ3_MAX_CHANNELS ? channel : 0]; }
+  /// @brief Anunta cardul ca ceva a INCEPUT sa cante prin placa - radio, Bluetooth sau o melodie
+  /// de pe card (chemata automat de load_track() la succes; scriptul YAML o cheama explicit si
+  /// pentru radio/Bluetooth). Foloseste doar pentru track_fits() - vezi acolo. Sigur de chemat
+  /// oricat de des.
+  void note_playback_active() { this->a_redat_ceva_ = true; }
 
-  /// @brief Average (RMS) energy of the most recently filtered block for one channel, in [0, 1].
-  /// A VU meter needs both numbers: the bar follows this average, while the floating dot follows
-  /// get_level(). Music typically peaks 10-15 dB above its average, which is exactly what puts a
-  /// visible gap between the two on the display.
-  float get_rms_level(uint8_t channel = 0) const {
-    return this->rms_level_[channel < EQ3_MAX_CHANNELS ? channel : 0];
-  }
+  /// @brief Citeste melodia de la indexul dat, INTEGRAL, de pe card in memoria externa (PSRAM),
+  /// si intoarce un audio::AudioFile gata de dat direct la media_player-ul de tip "speaker"
+  /// prin play_file(). Intoarce nullptr daca indexul e gresit, tipul fisierului nu e recunoscut
+  /// (doar MP3/WAV/FLAC/OPUS), fisierul nu se poate deschide, sau nu mai e memorie externa
+  /// libera pentru el - in toate cazurile, doar scrie un avertisment in log, nu opreste placa.
+  ///
+  /// ATENTIE: elibereaza automat bufferul melodiei ANTERIOARE inainte sa aloce cel nou, ca sa
+  /// foloseasca tot bugetul de PSRAM disponibil pentru o singura melodie, nu doar jumatate din
+  /// el. De-aia APELANTUL trebuie sa se asigure ca redarea melodiei anterioare chiar s-a oprit
+  /// (media_player.stop, urmat de o pauza) inainte sa cheme load_track() din nou - altfel risca
+  /// sa stearga de sub decodor un buffer inca in folosinta. Vezi schimba_melodie din YAML pentru
+  /// tiparul corect (acelasi tipar - stop + pauza - folosit deja la trecerea pe Bluetooth).
+  audio::AudioFile *load_track(int index);
 
-  /// @brief Zeroes both VU-meter values immediately, without touching playback state (unlike stop(),
-  /// which also stops output_speaker_ - the physical output). Call this the moment a source is about
-  /// to be switched (before its replacement starts), so a VU meter reading these values goes dark
-  /// right away instead of holding the last playing level frozen until the new source's audio starts
-  /// flowing through play() again.
-  void reset_levels() {
-    for (uint8_t ch = 0; ch < EQ3_MAX_CHANNELS; ch++) {
-      this->level_[ch] = 0.0f;
-      this->rms_level_[ch] = 0.0f;
-    }
-  }
+  /// @brief NOU - inlocuieste load_track()+play_file() pentru melodiile de pe card. Reda melodia
+  /// de la indexul dat "in flux" (streaming): o sarcina (task) dedicata citeste fisierul de pe
+  /// card bucata cu bucata (cativa KB o data), le decodeaza pe masura ce vin si trimite sunetul
+  /// DIRECT catre speakerul-sursa dat prin set_speaker() (vezi YAML: "speaker: sursa_muzica") -
+  /// FARA sa mai treaca prin media_player-ul "audio_player" si FARA sa mai citeasca vreodata
+  /// fisierul intreg in memorie mai intai.
+  ///
+  /// De ce: load_track() (mai sus) cerea tot fisierul deodata in memoria externa (PSRAM) - placa
+  /// are doar 4 MB PSRAM fizic, deci fisierele mari (peste ~2-3 MB, dupa cat mai era liber din
+  /// cei 4 MB) nu aveau NICIODATA cum sa incapa, oricat am fi ajustat marjele de siguranta.
+  /// play_track_streaming() nu mai are limita asta: foloseste un buffer inelar mic (INEL_FLUX,
+  /// cativa zeci de KB) prin care trec DOAR bucatile de fisier comprimat citite pe rand, nu tot
+  /// fisierul - deci orice melodie, indiferent cat de mare, poate fi acum redata.
+  ///
+  /// Opreste automat, mai intai, orice flux anterior inca activ (vezi stop_streaming()) - e sigur
+  /// sa o chemi oricand, chiar daca ceva canta deja prin ea. Intoarce false daca melodia nu a
+  /// putut fi pornita (index gresit, tip de fisier necunoscut, fisier lipsa/ilizibil, sau nu s-a
+  /// putut porni sarcina de streaming) - in toate cazurile, doar scrie un avertisment in log.
+  bool play_track_streaming(int index);
+
+  /// @brief Opreste fluxul curent (daca exista) si asteapta (cel mult ~2 secunde) ca sarcina lui
+  /// interna sa se termine curat singura - vezi comentariul din .cpp pentru cum se face oprirea
+  /// fara sa stergem sub ea resurse inca in folosinta. Sigur de chemat si daca nu canta nimic.
+  void stop_streaming();
+
+  /// @brief True cat timp play_track_streaming() a pornit o melodie si sarcina ei interna inca
+  /// lucreaza (citeste/decodeaza/reda) - folosit din YAML in loc de media_player.is_playing,
+  /// pentru ca "audio_player" nu mai stie nimic despre melodiile redate in flux.
+  bool is_streaming() const { return this->flux_activ_.load(); }
+
+  /// @brief Pune pe pauza (sau reia) melodia curenta redata in flux - sunetul se opreste/reia
+  /// aproape imediat. Sigur de chemat oricand, chiar daca nu canta nimic in flux acum (starea
+  /// se aplica automat cand porneste urmatoarea melodie).
+  void set_streaming_paused(bool pauza) { this->flux_pauza_.store(pauza); }
+  bool is_streaming_paused() const { return this->flux_pauza_.load(); }
+
+  /// @brief True EXACT O SINGURA DATA dupa ce o melodie redata in flux s-a terminat SINGURA,
+  /// natural (nu a fost oprita de stop_streaming() - adica nu a fost un skip manual sau o
+  /// schimbare de sursa). Gandita sa fie verificata periodic dintr-un "interval:" din YAML, ca
+  /// sa se poata trece automat la melodia urmatoare. Citirea "consuma" raspunsul (il pune inapoi
+  /// pe false), ca sa nu declansam de doua ori trecerea la urmatoarea melodie pentru acelasi
+  /// eveniment.
+  bool consume_finished_naturally() { return this->terminat_natural_.exchange(false); }
+
+  /// @brief Scrie in log, la nivel INFO, cati KB PSRAM sunt liberi (total si cel mai mare bloc
+  /// continuu) chiar acum, cu o eticheta data de apelant. Diagnostic pur - nu schimba nimic.
+  /// Gandit sa fie presarat prin scripturile YAML (inclusiv cele care NU ating deloc cardul, ca
+  /// schimba_post_radio) ca sa vedem exact CAND scade memoria disponibila, nu doar la incarcarea
+  /// unei melodii.
+  void log_psram(const char *eticheta) const;
 
  protected:
-  void update_bass_coeffs_();
-  void update_mid_coeffs_();
-  void update_treble_coeffs_();
+  std::string mount_point_{"/sd"};
+  std::string music_folder_{"/sd"};
 
-  /// @brief Recomputes the safety attenuation applied before filtering. Boosting a band raises the
-  /// signal, and audio that is already near full scale would then exceed it and get hard-clipped by
-  /// process_sample_(), which is audible as harsh crackling - worst on loud, heavily compressed
-  /// material such as rock, while quiet material like classical stays clean. Attenuating the input
-  /// by the largest boost first guarantees the cascade can never exceed full scale. The cost is
-  /// lower overall loudness, which the user compensates with the volume control.
-  void update_pre_gain_();
+  bool mounted_{false};
+  uint64_t size_mb_{0};
+  char name_[8]{};
 
-  /// @brief Runs one sample (normalized to [-1, 1)) through the 3-band cascade for the given channel.
-  float process_sample_(float x, uint8_t channel);
+  std::vector<std::string> tracks_;
 
-  speaker::Speaker *output_speaker_{nullptr};
+  // Bufferul (mic, din memoria INTERNA, potrivit pentru transfer direct) prin care trec toate
+  // citirile de pe card - vezi explicatia mare din load_track() despre de ce nu citim direct in
+  // memoria externa. Alocat o singura data, la prima folosire, si refolosit de fiecare data.
+  uint8_t *citire_{nullptr};
 
-  // Fixed-size scratch buffer for the filtered audio. Allocated once in start() (never during play()),
-  // per the project convention of avoiding heap allocation after setup.
-  std::unique_ptr<uint8_t[]> process_buffer_;
-  size_t process_buffer_size_{0};
+  // Bufferul (mare, din memoria externa) cu melodia CURENTA. NU mai tinem si melodia dinainte -
+  // testele au aratat ca placa are prea putin PSRAM liber (~2,7 MB, chiar si fara nimic de pe
+  // card) ca sa incapa doua melodii intregi simultan, chiar si pentru cateva secunde cat dura o
+  // tranzitie. Acum load_track() elibereaza mereu bufferul vechi INAINTE sa aloce cel nou, ca
+  // fiecare melodie sa poata folosi tot bugetul disponibil.
+  uint8_t *buffer_curent_{nullptr};
+  audio::AudioFile fisier_curent_{};
 
-  float bass_gain_db_{0.0f};
-  float mid_gain_db_{0.0f};
-  float treble_gain_db_{0.0f};
+  // Vezi note_playback_active() si track_fits() - tine minte daca a mai cantat ceva prin placa
+  // in sesiunea asta (de la ultimul boot), ca sa alegem marja de siguranta potrivita.
+  bool a_redat_ceva_{false};
 
-  // Loudest absolute sample of the last processed block, per channel, normalized to [0, 1].
-  volatile float level_[EQ3_MAX_CHANNELS]{};
+  // --- De aici in jos: doar pentru play_track_streaming()/stop_streaming() (vezi acolo) ---
 
-  // Average (RMS) energy of the last processed block, per channel, normalized to [0, 1].
-  volatile float rms_level_[EQ3_MAX_CHANNELS]{};
+  // Speakerul-sursa (ex: "sursa_muzica"), dat prin set_speaker() din YAML - tinta finala a
+  // sunetului decodat in flux.
+  speaker::Speaker *speaker_{nullptr};
 
-  // Linear factor applied to every sample before the filters. 1.0 when no band is boosted.
-  float pre_gain_{1.0f};
+  // Bufferul inelar (in memoria externa) prin care sarcina de flux alimenteaza decodorul, in
+  // bucati mici - vezi play_track_streaming(). Contine DOAR bytes de fisier comprimat (MP3 etc.),
+  // NU audio decodat - de-aia poate fi mic desi melodia intreaga are MB intregi. Detinut aici (nu
+  // doar de decodor) ca sa il putem crea INAINTE sa pornim sarcina si sa dam un weak_ptr atat
+  // sarcinii cat si decodorului.
+  std::shared_ptr<ring_buffer::RingBuffer> inel_flux_;
 
-  BiquadCoeffs bass_coeffs_;
-  BiquadCoeffs mid_coeffs_;
-  BiquadCoeffs treble_coeffs_;
+  // Decodorul folosit de sarcina de flux - creat/distrus o data pe melodie, in
+  // play_track_streaming()/in sarcina insasi la final. Atins DOAR din sarcina de flux dupa ce a
+  // pornit (niciodata din firul principal in acelasi timp - vezi stop_streaming()).
+  std::unique_ptr<audio::AudioDecoder> decodor_flux_;
 
-  BiquadState bass_state_[EQ3_MAX_CHANNELS];
-  BiquadState mid_state_[EQ3_MAX_CHANNELS];
-  BiquadState treble_state_[EQ3_MAX_CHANNELS];
+  // Fisierul curent, deschis in play_track_streaming() (pe firul principal, ca sa putem raporta
+  // imediat "fisier lipsa"), dar inchis de sarcina de flux insasi, la final.
+  FILE *fisier_flux_{nullptr};
+
+  // true cat timp sarcina de flux e pornita si lucreaza. Sarcina insasi il pune pe false ca ULTIM
+  // lucru pe care il face, chiar inainte sa se auto-stearga - vezi stop_streaming() pentru de ce
+  // conteaza ordinea asta.
+  std::atomic<bool> flux_activ_{false};
+  // Cerere de oprire pentru sarcina de flux curenta - pusa pe true de stop_streaming(), citita de
+  // sarcina la fiecare bucla a ei. std::atomic pentru ca e citit/scris din doua fire diferite.
+  std::atomic<bool> opreste_flux_{false};
+  // Cerere de pauza pentru sarcina de flux curenta - vezi set_streaming_paused().
+  std::atomic<bool> flux_pauza_{false};
+  // Pus pe true de sarcina de flux DOAR cand melodia s-a terminat singura (nu la skip/schimbare
+  // de sursa) - vezi consume_finished_naturally().
+  std::atomic<bool> terminat_natural_{false};
+
+  // Functia sarcinii (task) FreeRTOS dedicate care citeste+decodeaza+reda o melodie in flux. Vezi
+  // .cpp pentru ce face exact, pas cu pas.
+  static void flux_task_(void *param);
 };
 
-}  // namespace esphome::eq3
+}  // namespace esphome::sdcard
 
 #endif
