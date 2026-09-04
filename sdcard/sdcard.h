@@ -116,6 +116,20 @@ class SDCard : public Component {
   /// pentru ca "audio_player" nu mai stie nimic despre melodiile redate in flux.
   bool is_streaming() const { return this->flux_activ_.load(); }
 
+  /// @brief Pune pe pauza (sau reia) melodia curenta redata in flux - sunetul se opreste/reia
+  /// aproape imediat. Sigur de chemat oricand, chiar daca nu canta nimic in flux acum (starea
+  /// se aplica automat cand porneste urmatoarea melodie).
+  void set_streaming_paused(bool pauza) { this->flux_pauza_.store(pauza); }
+  bool is_streaming_paused() const { return this->flux_pauza_.load(); }
+
+  /// @brief True EXACT O SINGURA DATA dupa ce o melodie redata in flux s-a terminat SINGURA,
+  /// natural (nu a fost oprita de stop_streaming() - adica nu a fost un skip manual sau o
+  /// schimbare de sursa). Gandita sa fie verificata periodic dintr-un "interval:" din YAML, ca
+  /// sa se poata trece automat la melodia urmatoare. Citirea "consuma" raspunsul (il pune inapoi
+  /// pe false), ca sa nu declansam de doua ori trecerea la urmatoarea melodie pentru acelasi
+  /// eveniment.
+  bool consume_finished_naturally() { return this->terminat_natural_.exchange(false); }
+
   /// @brief Scrie in log, la nivel INFO, cati KB PSRAM sunt liberi (total si cel mai mare bloc
   /// continuu) chiar acum, cu o eticheta data de apelant. Diagnostic pur - nu schimba nimic.
   /// Gandit sa fie presarat prin scripturile YAML (inclusiv cele care NU ating deloc cardul, ca
@@ -179,6 +193,11 @@ class SDCard : public Component {
   // Cerere de oprire pentru sarcina de flux curenta - pusa pe true de stop_streaming(), citita de
   // sarcina la fiecare bucla a ei. std::atomic pentru ca e citit/scris din doua fire diferite.
   std::atomic<bool> opreste_flux_{false};
+  // Cerere de pauza pentru sarcina de flux curenta - vezi set_streaming_paused().
+  std::atomic<bool> flux_pauza_{false};
+  // Pus pe true de sarcina de flux DOAR cand melodia s-a terminat singura (nu la skip/schimbare
+  // de sursa) - vezi consume_finished_naturally().
+  std::atomic<bool> terminat_natural_{false};
 
   // Functia sarcinii (task) FreeRTOS dedicate care citeste+decodeaza+reda o melodie in flux. Vezi
   // .cpp pentru ce face exact, pas cu pas.
