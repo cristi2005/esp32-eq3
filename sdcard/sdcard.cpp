@@ -473,6 +473,24 @@ esp_err_t SDCard::http_handler_(httpd_req_t *request) {
   return ESP_OK;
 }
 
+void SDCard::stop_transfer() {
+  if (this->server_ == nullptr) {
+    return;
+  }
+  // Cerem serverului lista conexiunilor active (la noi, cel mult una - vezi max_open_sockets)
+  // si le inchidem pe rand, din afara sarcinii care le deserveste. E exact metoda recomandata
+  // de ESP-IDF pentru inchidere asincrona - vezi httpd_sess_trigger_close in documentatie.
+  size_t nr = 4;
+  int fds[4];
+  if (httpd_get_client_list(this->server_, &nr, fds) == ESP_OK) {
+    for (size_t i = 0; i < nr; i++) {
+      if (fds[i] >= 0) {
+        httpd_sess_trigger_close(this->server_, fds[i]);
+      }
+    }
+  }
+}
+
 void SDCard::scan_music() {
   this->tracks_.clear();
   if (!this->mounted_) {
