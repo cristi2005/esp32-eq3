@@ -66,6 +66,13 @@ class SDCard : public Component {
   /// tiparul corect (acelasi tipar - stop + pauza - folosit deja la trecerea pe Bluetooth).
   audio::AudioFile *load_track(int index);
 
+  /// @brief Scrie in log, la nivel INFO, cati KB PSRAM sunt liberi (total si cel mai mare bloc
+  /// continuu) chiar acum, cu o eticheta data de apelant. Diagnostic pur - nu schimba nimic.
+  /// Gandit sa fie presarat prin scripturile YAML (inclusiv cele care NU ating deloc cardul, ca
+  /// schimba_post_radio) ca sa vedem exact CAND scade memoria disponibila, nu doar la incarcarea
+  /// unei melodii.
+  void log_psram(const char *eticheta) const;
+
  protected:
   std::string mount_point_{"/sd"};
   std::string music_folder_{"/sd"};
