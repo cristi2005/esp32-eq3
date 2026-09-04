@@ -55,6 +55,33 @@ static constexpr size_t MARJA_PORNIRE_RECE = 1536 * 1024;
 // pentru variatii normale (antet de alocator, diferente mici intre marimile bufferelor).
 static constexpr size_t MARJA_SCHIMBARE_ACTIVA = 400 * 1024;
 
+// --- De aici in jos: doar pentru play_track_streaming()/stop_streaming()/flux_task_ (vezi .h) ---
+
+// Bufferul inelar, in memoria externa, prin care sarcina de flux alimenteaza decodorul cu bytes
+// de fisier COMPRIMAT (nu audio decodat) - de-aia poate fi mic (64 KB) desi o melodie intreaga
+// are MB intregi: la orice moment dat, doar cateva secunde de MP3 comprimat stau in memorie, nu
+// fisierul intreg. Asta e chiar rezolvarea cerintei "sa incapa toate melodiile, indiferent de
+// marime" - vezi comentariul mare de la play_track_streaming() din sdcard.h.
+static constexpr size_t INEL_FLUX = 64 * 1024;
+// Bufferele interne (intrare/iesire) ale decodorului - vezi AudioDecoder(...) din ESPHome. Nu au
+// legatura cu marimea fisierului, doar cu cat proceseaza decodorul o data.
+static constexpr size_t TRANSFER_FLUX = 8 * 1024;
+// Bucata de citire de pe card, o data, in bufferul inelar de mai sus. In memoria INTERNA (pe
+// stiva sarcinii) - fara nicio implicare a memoriei externe la citire, la fel ca la CITIRE_BUFFER
+// de mai sus.
+static constexpr size_t CITIRE_FLUX = 2 * 1024;
+// Stiva sarcinii de flux, in octeti. Genero asa (10 KB, mult peste cei ~2 KB folositi de bucata
+// de citire) ca sa acopere si citirea de pe card (FATFS/driverul de card) SI decodarea MP3 in
+// aceeasi sarcina, fara risc de suprascriere a stivei - o eroare care s-ar vedea greu in log.
+static constexpr uint32_t STIVA_FLUX = 10 * 1024;
+// Aceeasi prioritate folosita de ESPHome insusi pentru sarcinile lui de citire/decodare audio
+// (vezi speaker_media_player.cpp) - suficient de mica sa nu concureze cu WiFi sau bucla
+// principala a placii.
+static constexpr UBaseType_t PRIORITATE_FLUX = 1;
+// Cat asteptam, cel mult, ca sarcina de flux veche sa se opreasca singura inainte sa renuntam si
+// sa continuam oricum - vezi stop_streaming().
+static constexpr uint32_t ASTEPTARE_OPRIRE_FLUX_MS = 2000;
+
 namespace {
 
 /// Tipul fisierului, dupa terminatie. Fiecare varianta e aparata cu #ifdef, pentru ca placa nu
@@ -311,6 +338,187 @@ audio::AudioFile *SDCard::load_track(int index) {
   vTaskDelay(pdMS_TO_TICKS(80));
 
   return &this->fisier_curent_;
+}
+
+bool SDCard::play_track_streaming(int index) {
+  // Oprim mai intai orice flux anterior, curat - vezi stop_streaming(). Sigur de chemat si daca
+  // nu canta nimic in flux (nu face nimic in cazul asta).
+  this->stop_streaming();
+
+  if (index < 0 || index >= (int) this->tracks_.size()) {
+    ESP_LOGW(TAG, "Index de melodie invalid: %d", index);
+    return false;
+  }
+  if (this->speaker_ == nullptr) {
+    ESP_LOGE(TAG, "Lipseste \"speaker:\" din configuratia YAML a cardului - nu pot reda in flux.");
+    return false;
+  }
+
+  const std::string &nume = this->tracks_[index];
+  const audio::AudioFileType tip = tip_fisier_pentru(nume);
+  if (tip == audio::AudioFileType::NONE) {
+    ESP_LOGW(TAG, "Tip de fisier necunoscut sau nesuportat: %s", nume.c_str());
+    return false;
+  }
+
+  const std::string cale = this->music_folder_ + "/" + nume;
+  FILE *fisier = fopen(cale.c_str(), "rb");
+  if (fisier == nullptr) {
+    ESP_LOGW(TAG, "Nu gasesc fisierul %s", cale.c_str());
+    return false;
+  }
+
+  this->inel_flux_ = ring_buffer::RingBuffer::create(INEL_FLUX);
+  if (!this->inel_flux_) {
+    fclose(fisier);
+    ESP_LOGE(TAG, "Nu am memorie externa pentru bufferul inelar de flux (%u KB).",
+             (unsigned) (INEL_FLUX / 1024));
+    return false;
+  }
+
+  this->decodor_flux_ = std::make_unique<audio::AudioDecoder>(TRANSFER_FLUX, TRANSFER_FLUX);
+  std::weak_ptr<ring_buffer::RingBuffer> slab = this->inel_flux_;
+  if (this->decodor_flux_->add_source(slab) != ESP_OK) {
+    fclose(fisier);
+    this->decodor_flux_.reset();
+    this->inel_flux_.reset();
+    ESP_LOGE(TAG, "Nu am putut lega bufferul inelar de decodor.");
+    return false;
+  }
+  if (this->decodor_flux_->start(tip) != ESP_OK) {
+    fclose(fisier);
+    this->decodor_flux_.reset();
+    this->inel_flux_.reset();
+    ESP_LOGE(TAG, "Nu am putut porni decodorul pentru %s.", nume.c_str());
+    return false;
+  }
+
+  this->fisier_flux_ = fisier;
+  this->opreste_flux_.store(false);
+  this->flux_activ_.store(true);
+
+  if (xTaskCreate(&SDCard::flux_task_, "sd_flux", STIVA_FLUX, this, PRIORITATE_FLUX, nullptr) != pdPASS) {
+    ESP_LOGE(TAG, "Nu am putut porni sarcina de flux pentru %s.", nume.c_str());
+    fclose(this->fisier_flux_);
+    this->fisier_flux_ = nullptr;
+    this->decodor_flux_.reset();
+    this->inel_flux_.reset();
+    this->flux_activ_.store(false);
+    return false;
+  }
+
+  ESP_LOGI(TAG, "Redare in flux pornita: %s", nume.c_str());
+  this->a_redat_ceva_ = true;
+  return true;
+}
+
+void SDCard::stop_streaming() {
+  if (!this->flux_activ_.load()) {
+    return;
+  }
+  // Doar cerem oprirea - sarcina de flux insasi face toata curatenia (inchide fisierul,
+  // elibereaza decodorul si bufferul inelar, opreste speakerul) inainte sa se auto-stearga si sa
+  // puna flux_activ_ pe false ca ULTIM pas. Asteptam exact asta, nu stergem noi nimic de aici -
+  // orice resursa e atinsa DOAR din sarcina de flux cat timp e activa, ca sa nu avem doua fire
+  // care scriu in acelasi timp peste acelasi obiect.
+  this->opreste_flux_.store(true);
+  const int64_t start_us = esp_timer_get_time();
+  while (this->flux_activ_.load()) {
+    if ((esp_timer_get_time() - start_us) / 1000 > ASTEPTARE_OPRIRE_FLUX_MS) {
+      ESP_LOGW(TAG, "Sarcina de flux nu s-a oprit in %u ms - continui oricum.",
+               (unsigned) ASTEPTARE_OPRIRE_FLUX_MS);
+      break;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+void SDCard::flux_task_(void *param) {
+  auto *self = static_cast<SDCard *>(param);
+  audio::AudioDecoder *decodor = self->decodor_flux_.get();
+  ring_buffer::RingBuffer *inel = self->inel_flux_.get();
+
+  uint8_t bucata[CITIRE_FLUX];
+
+  bool citire_terminata = false;
+  bool are_info = false;
+  bool eroare = false;
+
+  while (true) {
+    if (self->opreste_flux_.load()) {
+      // Oprire ceruta (schimbare de melodie) - iesim imediat, fara sa mai golim ce-a ramas de
+      // decodat (speaker_->stop() de mai jos taie sunetul imediat, nu il lasa sa se termine
+      // frumos - corect pentru un skip, nu pentru sfarsitul normal al melodiei).
+      break;
+    }
+
+    if (!citire_terminata) {
+      const size_t liber = inel->free();
+      if (liber > 0) {
+        const size_t de_citit = std::min(liber, sizeof(bucata));
+        const size_t citit = fread(bucata, 1, de_citit, self->fisier_flux_);
+        if (citit > 0) {
+          inel->write_without_replacement(bucata, citit, 0);
+        } else {
+          // 0 octeti cititi = sfarsit de fisier (sau eroare de citire - oricum, nu mai avem ce
+          // adauga). "citire_terminata" ii spune decodorului sa termine ce mai are, apoi sa se
+          // opreasca singur (AudioDecoderState::FINISHED), nu sa astepte date care nu mai vin.
+          citire_terminata = true;
+        }
+      }
+    }
+
+    const audio::AudioDecoderState stare = decodor->decode(citire_terminata);
+
+    if (!are_info && decodor->get_audio_stream_info().has_value()) {
+      // Prima data cand decodorul a citit antetul fisierului si stie formatul real - de-abia
+      // acum putem lega speakerul ca destinatie a sunetului decodat (acelasi tipar folosit de
+      // pipeline-ul audio al ESPHome-ului insusi).
+      are_info = true;
+      const auto &info = decodor->get_audio_stream_info().value();
+      if (info.get_bits_per_sample() == 16 && info.get_channels() <= 2) {
+        self->speaker_->set_audio_stream_info(info);
+        decodor->add_sink(self->speaker_);
+      } else {
+        ESP_LOGE(TAG, "Format audio nesuportat in flux (%d biti, %d canale) - opresc.",
+                 (int) info.get_bits_per_sample(), (int) info.get_channels());
+        eroare = true;
+        break;
+      }
+    }
+
+    if (stare == audio::AudioDecoderState::FINISHED) {
+      break;
+    } else if (stare == audio::AudioDecoderState::FAILED) {
+      ESP_LOGW(TAG, "Eroare la decodarea fluxului - opresc melodia.");
+      eroare = true;
+      break;
+    }
+
+    // Cedam procesorul la fiecare bucla - decode() de mai sus are deja pauze scurte interne cand
+    // nu are ce face, dar asta e o plasa de siguranta in plus, ieftina, sa nu tinem procesorul
+    // ocupat degeaba cand bufferul inelar e plin si fisierul nu mai are de citit deocamdata.
+    vTaskDelay(1);
+  }
+
+  fclose(self->fisier_flux_);
+  self->fisier_flux_ = nullptr;
+
+  if (eroare || self->opreste_flux_.load()) {
+    // Eroare sau oprire ceruta (skip) - taiem sunetul imediat.
+    self->speaker_->stop();
+  } else {
+    // Sfarsit normal al melodiei - lasam speakerul sa termine de redat ce mai are in bufferul lui
+    // propriu, fara sa taie ultimele sunete.
+    self->speaker_->finish();
+  }
+
+  self->decodor_flux_.reset();
+  self->inel_flux_.reset();
+
+  // ULTIMUL lucru facut, dupa ce toata curatenia de mai sus s-a terminat - vezi stop_streaming().
+  self->flux_activ_.store(false);
+  vTaskDelete(nullptr);
 }
 
 void SDCard::scan_music() {
