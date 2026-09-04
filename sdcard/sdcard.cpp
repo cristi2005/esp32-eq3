@@ -138,9 +138,15 @@ bool SDCard::track_fits(int index) const {
   // orice melodie de aceeasi marime cu cea care tocmai canta.
   const size_t curent = (this->buffer_curent_ != nullptr) ? this->fisier_curent_.length : 0;
   const size_t liber_dupa_eliberare = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) + curent;
-  // Marja de siguranta: alocatorul de PSRAM mai pierde cate ceva la fiecare alocare/eliberare
-  // (antet, aliniere) - nu ne bazam pe granita exacta.
-  const size_t marja_siguranta = 64 * 1024;
+  // Marja de siguranta - mult mai mare decat un simplu antet de alocator. Testele au aratat ca,
+  // dupa ce bufferul nostru de melodie ocupa aproape tot PSRAM-ul liber (a ramas doar ~220-320
+  // KB), play_file() a esuat in cascada cu "ESP_ERR_NO_MEM": pipeline-ul audio al ESPHome-ului
+  // insusi (decodorul, buffer-ele lui de legatura catre mixer) are nevoie de PSRAM PROASPAT
+  // alocat chiar in clipa in care porneste redarea - buget separat de bufferul nostru de melodie,
+  // care nu exista inca atunci cand facem NOI verificarea. Melodiile care au lasat liber cel putin
+  // ~1,4 MB dupa incarcare au cantat fara nicio eroare - deci pastram un plafon confortabil sub
+  // acel prag, cu rezerva.
+  const size_t marja_siguranta = 1536 * 1024;
   return marime + marja_siguranta <= liber_dupa_eliberare;
 }
 
