@@ -38,6 +38,23 @@ static constexpr size_t MAX_TRACKS = 200;
 // avertisment in log, fara sa opreasca placa.
 static constexpr size_t MELODIE_MAXIM = 12 * 1024 * 1024;
 
+// Cele doua marje de siguranta folosite de track_fits() - vezi acolo pentru cum se aleg intre
+// ele. Masurate direct din teste: intre momentul in care noi terminam de citit o melodie (inainte
+// de play_file()) si momentul in care chiar canta, PSRAM-ul liber a mai scazut cu ~1300 KB -
+// pipeline-ul audio al ESPHome-ului insusi (decodorul, buffer-ele lui de legatura catre mixer)
+// isi aloca ATUNCI propriile buffere, separat de al nostru, si le tine cat timp REDA activ ceva.
+//
+// MARJA_PORNIRE_RECE: pentru prima verificare din sesiune (nu a mai cantat inca nimic prin placa
+// - nici radio, nici Bluetooth, nici card). Bugetul pipeline-ului de mai sus INCA NU exista, deci
+// trebuie sa il rezervam noi, integral, dinainte sa incepem redarea.
+static constexpr size_t MARJA_PORNIRE_RECE = 1536 * 1024;
+// MARJA_SCHIMBARE_ACTIVA: pentru cand deja canta ceva (radio, Bluetooth sau o alta melodie) -
+// oprirea sursei vechi (media_player.stop(), chemat inainte de load_track()) elibereaza bugetul
+// pipeline-ului DEJA consumat de ea, aproape exact cat va cere din nou sursa noua - cele doua se
+// anuleaza intre ele, deci nu mai trebuie rezervate a doua oara. Ramane doar o rezerva mica,
+// pentru variatii normale (antet de alocator, diferente mici intre marimile bufferelor).
+static constexpr size_t MARJA_SCHIMBARE_ACTIVA = 400 * 1024;
+
 namespace {
 
 /// Tipul fisierului, dupa terminatie. Fiecare varianta e aparata cu #ifdef, pentru ca placa nu
@@ -144,15 +161,8 @@ bool SDCard::track_fits(int index) const {
   // orice melodie de aceeasi marime cu cea care tocmai canta.
   const size_t curent = (this->buffer_curent_ != nullptr) ? this->fisier_curent_.length : 0;
   const size_t liber_dupa_eliberare = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) + curent;
-  // Marja de siguranta - mult mai mare decat un simplu antet de alocator. Testele au aratat ca,
-  // dupa ce bufferul nostru de melodie ocupa aproape tot PSRAM-ul liber (a ramas doar ~220-320
-  // KB), play_file() a esuat in cascada cu "ESP_ERR_NO_MEM": pipeline-ul audio al ESPHome-ului
-  // insusi (decodorul, buffer-ele lui de legatura catre mixer) are nevoie de PSRAM PROASPAT
-  // alocat chiar in clipa in care porneste redarea - buget separat de bufferul nostru de melodie,
-  // care nu exista inca atunci cand facem NOI verificarea. Melodiile care au lasat liber cel putin
-  // ~1,4 MB dupa incarcare au cantat fara nicio eroare - deci pastram un plafon confortabil sub
-  // acel prag, cu rezerva.
-  const size_t marja_siguranta = 1536 * 1024;
+  // Vezi comentariul de la MARJA_PORNIRE_RECE / MARJA_SCHIMBARE_ACTIVA, mai sus in fisier.
+  const size_t marja_siguranta = this->a_redat_ceva_ ? MARJA_SCHIMBARE_ACTIVA : MARJA_PORNIRE_RECE;
   return marime + marja_siguranta <= liber_dupa_eliberare;
 }
 
@@ -287,6 +297,9 @@ audio::AudioFile *SDCard::load_track(int index) {
   this->fisier_curent_.data = this->buffer_curent_;
   this->fisier_curent_.length = (size_t) marime;
   this->fisier_curent_.file_type = tip;
+  // De-acum, la urmatoarea verificare track_fits() folosim marja mica (MARJA_SCHIMBARE_ACTIVA) -
+  // vezi comentariul de acolo.
+  this->a_redat_ceva_ = true;
 
   // O mica pauza inainte sa intoarcem bufferul: in teste, chiar dupa o citire lunga si blocanta
   // de pe card, difuzorul I2S a ratat evenimente la repornire ("ISR event queue overflow,
