@@ -12,6 +12,9 @@
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -217,6 +220,7 @@ audio::AudioFile *SDCard::load_track(int index) {
 
   const int64_t start_us = esp_timer_get_time();
   size_t scris = 0;
+  int bucati_citite = 0;
   while (scris < (size_t) marime) {
     const size_t de_citit = std::min(CITIRE_BUFFER, (size_t) marime - scris);
     size_t citit;
@@ -234,6 +238,13 @@ audio::AudioFile *SDCard::load_track(int index) {
       break;
     }
     scris += citit;
+    // Cedam procesorul din cand in cand (nu la fiecare bucata, ca sa nu incetinim citirea
+    // simtitor) - o citire mare, tinuta strans intr-o singura bucla fara pauza, s-a dovedit ca
+    // sufoca restul placii destul cat sa strice sincronizarea difuzorului I2S la repornire (vezi
+    // pauza de la sfarsitul functiei, mai jos, pentru explicatia completa).
+    if (++bucati_citite % 16 == 0) {
+      vTaskDelay(1);
+    }
   }
   fclose(fisier);
 
@@ -257,6 +268,16 @@ audio::AudioFile *SDCard::load_track(int index) {
   this->fisier_curent_.data = this->buffer_curent_;
   this->fisier_curent_.length = (size_t) marime;
   this->fisier_curent_.file_type = tip;
+
+  // O mica pauza inainte sa intoarcem bufferul: in teste, chiar dupa o citire lunga si blocanta
+  // de pe card, difuzorul I2S a ratat evenimente la repornire ("ISR event queue overflow,
+  // restarting speaker task") - auzit ca o mica intrerupere exact la inceputul melodiei noi
+  // (confirmat de utilizator). Cauza, conform sursei ESPHome: coada de evenimente a driverului
+  // I2S nu a fost golita la timp, cel mai probabil pentru ca citirea de mai sus a tinut placa
+  // ocupata. Aceasta pauza lasa placa sa se "linisteasca" INAINTE ca apelantul sa cheme
+  // play_file() si sa reporneasca I2S-ul, ca pornirea sa nu mai coincida cu coada inca incarcata.
+  vTaskDelay(pdMS_TO_TICKS(80));
+
   return &this->fisier_curent_;
 }
 
