@@ -44,21 +44,27 @@ class SDCard : public Component {
   /// @brief Numele melodiei (fara cale), pentru afisat. Sir gol daca indexul e gresit.
   std::string track_name(int index) const;
 
+  /// @brief Spune daca melodia de la indexul dat ar incapea in memoria externa DUPA ce am
+  /// elibera bufferul curent (daca exista) - o verificare ieftina (doar marimea fisierului pe
+  /// disc, fara sa il citim). Foloseste cel mai mare bloc CONTINUU liber, nu doar totalul - un
+  /// fisier poate sa nu incapa chiar daca suma bucatilor libere ar ajunge, daca memoria e
+  /// fragmentata. Gandita sa fie chemata INAINTE sa oprim redarea curenta (vezi schimba_melodie
+  /// din YAML), ca sa nu taiem sunetul degeaba pentru o melodie care oricum nu are cum sa incapa.
+  bool track_fits(int index) const;
+
   /// @brief Citeste melodia de la indexul dat, INTEGRAL, de pe card in memoria externa (PSRAM),
   /// si intoarce un audio::AudioFile gata de dat direct la media_player-ul de tip "speaker"
   /// prin play_file(). Intoarce nullptr daca indexul e gresit, tipul fisierului nu e recunoscut
   /// (doar MP3/WAV/FLAC/OPUS), fisierul nu se poate deschide, sau nu mai e memorie externa
   /// libera pentru el - in toate cazurile, doar scrie un avertisment in log, nu opreste placa.
   ///
-  /// Bufferul intors ramane valabil pana la URMATOAREA chemare a lui load_track() - apelantul
-  /// nu trebuie sa il elibereze singur.
+  /// ATENTIE: elibereaza automat bufferul melodiei ANTERIOARE inainte sa aloce cel nou, ca sa
+  /// foloseasca tot bugetul de PSRAM disponibil pentru o singura melodie, nu doar jumatate din
+  /// el. De-aia APELANTUL trebuie sa se asigure ca redarea melodiei anterioare chiar s-a oprit
+  /// (media_player.stop, urmat de o pauza) inainte sa cheme load_track() din nou - altfel risca
+  /// sa stearga de sub decodor un buffer inca in folosinta. Vezi schimba_melodie din YAML pentru
+  /// tiparul corect (acelasi tipar - stop + pauza - folosit deja la trecerea pe Bluetooth).
   audio::AudioFile *load_track(int index);
-
-  /// @brief Elibereaza bufferul melodiei DINAINTEA celei curente, daca mai e tinut minte unul.
-  /// Apeleaz-o dupa ce te-ai asigurat ca melodia noua chiar canta (media_player.is_playing),
-  /// ca sa nu tii doua melodii intregi in memorie decat cat dureaza tranzitia. Sigur de apelat
-  /// oricand, chiar daca nu e nimic de eliberat.
-  void free_previous();
 
  protected:
   std::string mount_point_{"/sd"};
@@ -75,13 +81,12 @@ class SDCard : public Component {
   // memoria externa. Alocat o singura data, la prima folosire, si refolosit de fiecare data.
   uint8_t *citire_{nullptr};
 
-  // Bufferul (mare, din memoria externa) cu melodia CURENTA, si cel cu melodia DINAINTEA ei.
-  // Cel dinainte NU se elibereaza automat la urmatoarea incarcare - ramane in viata pana cand
-  // cineva cheama explicit free_previous() (scriptul YAML o face imediat ce media_player confirma
-  // ca melodia noua chiar canta). Asa tinem fereastra in care exista doua melodii intregi simultan
-  // in memorie cat mai scurta posibil - doar tranzitia, nu o melodie intreaga.
-  uint8_t *buffer_acum_{nullptr};
-  uint8_t *buffer_dinainte_{nullptr};
+  // Bufferul (mare, din memoria externa) cu melodia CURENTA. NU mai tinem si melodia dinainte -
+  // testele au aratat ca placa are prea putin PSRAM liber (~2,7 MB, chiar si fara nimic de pe
+  // card) ca sa incapa doua melodii intregi simultan, chiar si pentru cateva secunde cat dura o
+  // tranzitie. Acum load_track() elibereaza mereu bufferul vechi INAINTE sa aloce cel nou, ca
+  // fiecare melodie sa poata folosi tot bugetul disponibil.
+  uint8_t *buffer_curent_{nullptr};
   audio::AudioFile fisier_curent_{};
 };
 
