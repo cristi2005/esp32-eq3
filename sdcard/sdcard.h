@@ -52,6 +52,17 @@ class SDCard : public Component {
   /// @brief Adresa completa pe care i-o dai playerului. Sir gol daca indexul e gresit.
   std::string track_url(int index) const;
 
+  /// @brief Inchide imediat, din afara, orice transfer de fisier ramas activ pe server.
+  ///
+  /// De ce ne trebuie: cand utilizatorul trece de pe card pe alta sursa (radio sau Bluetooth),
+  /// playerul deschide o conexiune noua, dar noi aflam ca cea veche s-a inchis abia la
+  /// urmatoarea incercare de trimitere - uneori la cateva secunde distanta. Pana atunci, sarcina
+  /// serverului nostru (cu bufferul si stiva ei, memorie interna DMA) ramane alocata exact cand
+  /// noua sursa are nevoie sa-si realoce propriile bufere DMA pentru difuzor - cele doua se pot
+  /// calca pe picioare. Aici inchidem noi conexiunea, dinadins, inainte sa apuce sa se ceara.
+  /// Nu face nimic daca nu exista niciun transfer activ.
+  void stop_transfer();
+
  protected:
   void start_http_server_();
   /// @brief Trimite fisierul cerut, bucata cu bucata. Ruleaza pe sarcina serverului web.
