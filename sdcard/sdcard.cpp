@@ -123,6 +123,12 @@ void SDCard::setup() {
   this->scan_music();
 }
 
+void SDCard::log_psram(const char *eticheta) const {
+  ESP_LOGI(TAG, "PSRAM (%s): %u KB liberi total, %u KB cel mai mare bloc continuu.", eticheta,
+           (unsigned) (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+           (unsigned) (heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));
+}
+
 bool SDCard::track_fits(int index) const {
   if (index < 0 || index >= (int) this->tracks_.size()) {
     return false;
