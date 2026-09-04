@@ -119,6 +119,27 @@ void SDCard::setup() {
   this->scan_music();
 }
 
+bool SDCard::track_fits(int index) const {
+  if (index < 0 || index >= (int) this->tracks_.size()) {
+    return false;
+  }
+  const std::string cale = this->music_folder_ + "/" + this->tracks_[index];
+  struct stat info;
+  if (stat(cale.c_str(), &info) != 0 || info.st_size <= 0) {
+    return false;
+  }
+  const size_t marime = (size_t) info.st_size;
+  // Dupa ce bufferul curent se elibereaza (chiar inainte de alocarea noua, in load_track()),
+  // acel spatiu devine din nou disponibil - il adaugam la calcul, altfel am refuza pe nedrept
+  // orice melodie de aceeasi marime cu cea care tocmai canta.
+  const size_t curent = (this->buffer_curent_ != nullptr) ? this->fisier_curent_.length : 0;
+  const size_t liber_dupa_eliberare = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) + curent;
+  // Marja de siguranta: alocatorul de PSRAM mai pierde cate ceva la fiecare alocare/eliberare
+  // (antet, aliniere) - nu ne bazam pe granita exacta.
+  const size_t marja_siguranta = 64 * 1024;
+  return marime + marja_siguranta <= liber_dupa_eliberare;
+}
+
 audio::AudioFile *SDCard::load_track(int index) {
   if (index < 0 || index >= (int) this->tracks_.size()) {
     ESP_LOGW(TAG, "Index de melodie invalid: %d", index);
@@ -158,10 +179,23 @@ audio::AudioFile *SDCard::load_track(int index) {
     return nullptr;
   }
 
+  // Eliberam bufferul melodiei ANTERIOARE ACUM, inainte sa alocam cel nou - e sigur doar pentru
+  // ca apelantul (schimba_melodie din YAML) a oprit deja redarea si a asteptat o pauza inainte
+  // sa cheme load_track() din nou (acelasi tipar stop+pauza folosit si la trecerea pe Bluetooth).
+  // Asa fiecare melodie foloseste tot bugetul de PSRAM disponibil, nu doar jumatate din el, cat
+  // am tine si melodia veche "de rezerva" pana la urmatoarea schimbare.
+  if (this->buffer_curent_ != nullptr) {
+    heap_caps_free(this->buffer_curent_);
+    this->buffer_curent_ = nullptr;
+    this->fisier_curent_ = {};
+  }
+
   uint8_t *bufer_nou = (uint8_t *) heap_caps_malloc((size_t) marime, MALLOC_CAP_SPIRAM);
   if (bufer_nou == nullptr) {
     fclose(fisier);
-    ESP_LOGE(TAG, "Nu (mai) am memorie externa pentru %s (%ld KB). PSRAM liber: %u KB total, %u KB cel mai mare bloc continuu.",
+    ESP_LOGE(TAG,
+             "Nu (mai) am memorie externa pentru %s (%ld KB). PSRAM liber: %u KB total, %u KB cel "
+             "mai mare bloc continuu. Melodia anterioara a fost oprita si golita din memorie.",
              nume.c_str(), marime / 1024, (unsigned) (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
              (unsigned) (heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));
     return nullptr;
@@ -219,29 +253,11 @@ audio::AudioFile *SDCard::load_track(int index) {
            (unsigned) (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
            (unsigned) (heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));
 
-  // NU mai eliberam automat bufferul vechi aici - vezi free_previous(). Daca a mai ramas unul
-  // neeliberat de la schimbarea anterioara (adica scriptul YAML nu a apucat sa cheme
-  // free_previous() inainte sa ceara deja o alta melodie noua), il eliberam acum, ca plasa de
-  // siguranta, ca sa nu pierdem memorie definitiv - dar in mod normal nu ar trebui sa se intample.
-  if (this->buffer_dinainte_ != nullptr) {
-    ESP_LOGW(TAG, "free_previous() nu a fost chemat inainte de urmatoarea schimbare - eliberez acum, cu intarziere.");
-    heap_caps_free(this->buffer_dinainte_);
-    this->buffer_dinainte_ = nullptr;
-  }
-  this->buffer_dinainte_ = this->buffer_acum_;
-  this->buffer_acum_ = bufer_nou;
-
-  this->fisier_curent_.data = this->buffer_acum_;
+  this->buffer_curent_ = bufer_nou;
+  this->fisier_curent_.data = this->buffer_curent_;
   this->fisier_curent_.length = (size_t) marime;
   this->fisier_curent_.file_type = tip;
   return &this->fisier_curent_;
-}
-
-void SDCard::free_previous() {
-  if (this->buffer_dinainte_ != nullptr) {
-    heap_caps_free(this->buffer_dinainte_);
-    this->buffer_dinainte_ = nullptr;
-  }
 }
 
 void SDCard::scan_music() {
