@@ -201,16 +201,34 @@ void SDCard::setup() {
   ESP_LOGI(TAG, "Card montat la %s: %s, %llu MB", this->mount_point_.c_str(), this->name_, this->size_mb_);
 
   this->scan_music();
-  // Serverul se porneste in loop(), nu aici - vezi explicatia de la declaratia lui loop().
+  // Serverul NU se porneste aici - vezi ensure_server_started(). Cat timp nu asculti nimic de
+  // pe card, nu tine rost sa stea alocata memorie DMA pentru el.
 }
 
-void SDCard::loop() {
-  if (!this->server_pornit_) {
-    this->server_pornit_ = true;
-    this->start_http_server_();
+void SDCard::ensure_server_started() {
+  if (this->server_pornit_) {
+    return;  // deja ruleaza
   }
-  // Nu mai avem nimic de facut in bucla - o oprim, ca sa nu incarcam degeaba placa.
-  this->disable_loop();
+  this->server_pornit_ = true;
+  this->start_http_server_();
+}
+
+void SDCard::stop_server() {
+  if (this->server_ == nullptr) {
+    return;  // nu ruleaza - nimic de oprit
+  }
+  // httpd_stop() inchide si conexiunile inca deschise, nu doar serverul - nu mai trebuie sa
+  // chemam separat stop_transfer() inainte.
+  httpd_stop(this->server_);
+  this->server_ = nullptr;
+  if (this->buffer_ != nullptr) {
+    heap_caps_free(this->buffer_);
+    this->buffer_ = nullptr;
+    this->buffer_size_ = 0;
+  }
+  this->server_pornit_ = false;
+  ESP_LOGI(TAG, "Server de fisiere oprit - memoria interna e libera pentru sursa noua. Acum: %u octeti.",
+           (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 }
 
 void SDCard::start_http_server_() {
