@@ -2,6 +2,7 @@
 
 #ifdef USE_ESP32
 
+#include "esphome/core/application.h"
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 
@@ -238,7 +239,13 @@ audio::AudioFile *SDCard::load_track(int index) {
       break;
     }
     scris += citit;
-    // Cedam procesorul din cand in cand (nu la fiecare bucata, ca sa nu incetinim citirea
+    // "Hranim" watchdog-ul de sarcini la FIECARE bucata: fara asta, placa se resetase singura
+    // (task_wdt: "loopTask did not reset the watchdog in time") la melodiile mai mari, pentru ca
+    // App.feed_wdt() normal se cheama o data pe ciclul principal al ESPHome - iar cat timp
+    // functia asta nu se termina, acel ciclu nu ajunge sa se mai execute deloc. Ieftin, sigur de
+    // chemat oricat de des.
+    App.feed_wdt();
+    // Cedam si procesorul din cand in cand (nu la fiecare bucata, ca sa nu incetinim citirea
     // simtitor) - o citire mare, tinuta strans intr-o singura bucla fara pauza, s-a dovedit ca
     // sufoca restul placii destul cat sa strice sincronizarea difuzorului I2S la repornire (vezi
     // pauza de la sfarsitul functiei, mai jos, pentru explicatia completa).
