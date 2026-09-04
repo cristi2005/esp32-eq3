@@ -4,7 +4,13 @@
 
 #include "esphome/core/component.h"
 #include "esphome/components/audio/audio.h"
+#include "esphome/components/audio/audio_decoder.h"
+#include "esphome/components/ring_buffer/ring_buffer.h"
+#include "esphome/components/speaker/speaker.h"
 
+#include <atomic>
+#include <cstdio>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -24,6 +30,10 @@ class SDCard : public Component {
 
   void set_mount_point(const std::string &mount_point) { this->mount_point_ = mount_point; }
   void set_music_folder(const std::string &music_folder) { this->music_folder_ = music_folder; }
+  /// @brief Speakerul-sursa (din YAML, ex: "sursa_muzica") catre care play_track_streaming() va
+  /// trimite DIRECT sunetul decodat, bucata cu bucata - vezi comentariul mare de la
+  /// play_track_streaming() mai jos.
+  void set_speaker(speaker::Speaker *spk) { this->speaker_ = spk; }
 
   bool is_mounted() const { return this->mounted_; }
 
@@ -76,6 +86,36 @@ class SDCard : public Component {
   /// tiparul corect (acelasi tipar - stop + pauza - folosit deja la trecerea pe Bluetooth).
   audio::AudioFile *load_track(int index);
 
+  /// @brief NOU - inlocuieste load_track()+play_file() pentru melodiile de pe card. Reda melodia
+  /// de la indexul dat "in flux" (streaming): o sarcina (task) dedicata citeste fisierul de pe
+  /// card bucata cu bucata (cativa KB o data), le decodeaza pe masura ce vin si trimite sunetul
+  /// DIRECT catre speakerul-sursa dat prin set_speaker() (vezi YAML: "speaker: sursa_muzica") -
+  /// FARA sa mai treaca prin media_player-ul "audio_player" si FARA sa mai citeasca vreodata
+  /// fisierul intreg in memorie mai intai.
+  ///
+  /// De ce: load_track() (mai sus) cerea tot fisierul deodata in memoria externa (PSRAM) - placa
+  /// are doar 4 MB PSRAM fizic, deci fisierele mari (peste ~2-3 MB, dupa cat mai era liber din
+  /// cei 4 MB) nu aveau NICIODATA cum sa incapa, oricat am fi ajustat marjele de siguranta.
+  /// play_track_streaming() nu mai are limita asta: foloseste un buffer inelar mic (INEL_FLUX,
+  /// cativa zeci de KB) prin care trec DOAR bucatile de fisier comprimat citite pe rand, nu tot
+  /// fisierul - deci orice melodie, indiferent cat de mare, poate fi acum redata.
+  ///
+  /// Opreste automat, mai intai, orice flux anterior inca activ (vezi stop_streaming()) - e sigur
+  /// sa o chemi oricand, chiar daca ceva canta deja prin ea. Intoarce false daca melodia nu a
+  /// putut fi pornita (index gresit, tip de fisier necunoscut, fisier lipsa/ilizibil, sau nu s-a
+  /// putut porni sarcina de streaming) - in toate cazurile, doar scrie un avertisment in log.
+  bool play_track_streaming(int index);
+
+  /// @brief Opreste fluxul curent (daca exista) si asteapta (cel mult ~2 secunde) ca sarcina lui
+  /// interna sa se termine curat singura - vezi comentariul din .cpp pentru cum se face oprirea
+  /// fara sa stergem sub ea resurse inca in folosinta. Sigur de chemat si daca nu canta nimic.
+  void stop_streaming();
+
+  /// @brief True cat timp play_track_streaming() a pornit o melodie si sarcina ei interna inca
+  /// lucreaza (citeste/decodeaza/reda) - folosit din YAML in loc de media_player.is_playing,
+  /// pentru ca "audio_player" nu mai stie nimic despre melodiile redate in flux.
+  bool is_streaming() const { return this->flux_activ_.load(); }
+
   /// @brief Scrie in log, la nivel INFO, cati KB PSRAM sunt liberi (total si cel mai mare bloc
   /// continuu) chiar acum, cu o eticheta data de apelant. Diagnostic pur - nu schimba nimic.
   /// Gandit sa fie presarat prin scripturile YAML (inclusiv cele care NU ating deloc cardul, ca
@@ -109,6 +149,40 @@ class SDCard : public Component {
   // Vezi note_playback_active() si track_fits() - tine minte daca a mai cantat ceva prin placa
   // in sesiunea asta (de la ultimul boot), ca sa alegem marja de siguranta potrivita.
   bool a_redat_ceva_{false};
+
+  // --- De aici in jos: doar pentru play_track_streaming()/stop_streaming() (vezi acolo) ---
+
+  // Speakerul-sursa (ex: "sursa_muzica"), dat prin set_speaker() din YAML - tinta finala a
+  // sunetului decodat in flux.
+  speaker::Speaker *speaker_{nullptr};
+
+  // Bufferul inelar (in memoria externa) prin care sarcina de flux alimenteaza decodorul, in
+  // bucati mici - vezi play_track_streaming(). Contine DOAR bytes de fisier comprimat (MP3 etc.),
+  // NU audio decodat - de-aia poate fi mic desi melodia intreaga are MB intregi. Detinut aici (nu
+  // doar de decodor) ca sa il putem crea INAINTE sa pornim sarcina si sa dam un weak_ptr atat
+  // sarcinii cat si decodorului.
+  std::shared_ptr<ring_buffer::RingBuffer> inel_flux_;
+
+  // Decodorul folosit de sarcina de flux - creat/distrus o data pe melodie, in
+  // play_track_streaming()/in sarcina insasi la final. Atins DOAR din sarcina de flux dupa ce a
+  // pornit (niciodata din firul principal in acelasi timp - vezi stop_streaming()).
+  std::unique_ptr<audio::AudioDecoder> decodor_flux_;
+
+  // Fisierul curent, deschis in play_track_streaming() (pe firul principal, ca sa putem raporta
+  // imediat "fisier lipsa"), dar inchis de sarcina de flux insasi, la final.
+  FILE *fisier_flux_{nullptr};
+
+  // true cat timp sarcina de flux e pornita si lucreaza. Sarcina insasi il pune pe false ca ULTIM
+  // lucru pe care il face, chiar inainte sa se auto-stearga - vezi stop_streaming() pentru de ce
+  // conteaza ordinea asta.
+  std::atomic<bool> flux_activ_{false};
+  // Cerere de oprire pentru sarcina de flux curenta - pusa pe true de stop_streaming(), citita de
+  // sarcina la fiecare bucla a ei. std::atomic pentru ca e citit/scris din doua fire diferite.
+  std::atomic<bool> opreste_flux_{false};
+
+  // Functia sarcinii (task) FreeRTOS dedicate care citeste+decodeaza+reda o melodie in flux. Vezi
+  // .cpp pentru ce face exact, pas cu pas.
+  static void flux_task_(void *param);
 };
 
 }  // namespace esphome::sdcard
