@@ -22,10 +22,11 @@ namespace esphome::sdcard {
 
 static const char *const TAG = "sdcard";
 
-// Bufferul de citire prin memoria interna. 16 KB - mai mare decat inainte, pentru ca acum e
-// SINGURUL consumator de memorie al componentei (nu mai exista server, stiva, socket) si citirea
-// se face o singura data, la schimbarea melodiei, nu tot timpul redarii - merita sa fie rapida.
-static constexpr size_t CITIRE_BUFFER = 16 * 1024;
+// Bufferul de citire prin memoria interna. Redus la 8 KB (de la 16 KB): in teste reale, cu
+// radio/Bluetooth active, alocarea de 16 KB in memoria INTERNA (DMA) a esuat cel putin o data -
+// memoria interna e mult mai putina si mai disputata decat cea externa (PSRAM), si 8 KB tot e
+// suficient de mare cat sa nu incetineasca simtitor citirea.
+static constexpr size_t CITIRE_BUFFER = 8 * 1024;
 static constexpr size_t MAX_TRACKS = 200;
 // Cat de mare poate fi o melodie ca sa incapa in memoria externa. La 128 kbps, 12 MB inseamna
 // peste 12 minute de muzica - ar trebui sa acopere orice fisier normal. Daca nu incape (sau nu
@@ -108,6 +109,13 @@ void SDCard::setup() {
   std::strncpy(this->name_, card->cid.name, sizeof(this->name_) - 1);
   ESP_LOGI(TAG, "Card montat la %s: %s, %llu MB", this->mount_point_.c_str(), this->name_, this->size_mb_);
 
+  // Cat PSRAM avem disponibil chiar de la bootare, INAINTE sa fi incarcat vreo melodie - ne
+  // trebuie ca reper, ca sa stim daca esecurile de alocare de mai tarziu sunt din lipsa reala de
+  // memorie sau din fragmentare (bloc mare liber mult mai mic decat totalul liber).
+  ESP_LOGI(TAG, "PSRAM la boot: %u KB liberi total, %u KB in cel mai mare bloc continuu.",
+           (unsigned) (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+           (unsigned) (heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));
+
   this->scan_music();
 }
 
@@ -153,7 +161,9 @@ audio::AudioFile *SDCard::load_track(int index) {
   uint8_t *bufer_nou = (uint8_t *) heap_caps_malloc((size_t) marime, MALLOC_CAP_SPIRAM);
   if (bufer_nou == nullptr) {
     fclose(fisier);
-    ESP_LOGE(TAG, "Nu (mai) am memorie externa pentru %s (%ld KB).", nume.c_str(), marime / 1024);
+    ESP_LOGE(TAG, "Nu (mai) am memorie externa pentru %s (%ld KB). PSRAM liber: %u KB total, %u KB cel mai mare bloc continuu.",
+             nume.c_str(), marime / 1024, (unsigned) (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+             (unsigned) (heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));
     return nullptr;
   }
 
@@ -201,16 +211,22 @@ audio::AudioFile *SDCard::load_track(int index) {
   }
 
   const int64_t durata_ms = (esp_timer_get_time() - start_us) / 1000;
-  ESP_LOGI(TAG, "Melodia \"%s\" incarcata in memoria externa: %u KB in %lld ms (%.1f KB/s).", nume.c_str(),
-           (unsigned) (marime / 1024), (long long) durata_ms,
-           durata_ms > 0 ? (marime / 1024.0) / (durata_ms / 1000.0) : 0.0);
+  ESP_LOGI(TAG,
+           "Melodia \"%s\" incarcata in memoria externa: %u KB in %lld ms (%.1f KB/s). PSRAM liber "
+           "dupa: %u KB total, %u KB cel mai mare bloc continuu.",
+           nume.c_str(), (unsigned) (marime / 1024), (long long) durata_ms,
+           durata_ms > 0 ? (marime / 1024.0) / (durata_ms / 1000.0) : 0.0,
+           (unsigned) (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+           (unsigned) (heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));
 
-  // Eliberam bufferul melodiei DINAINTEA celei dinainte (nu pe cel curent!) - pipeline-ul audio
-  // poate inca sa citeasca din cel care tocmai a devenit "vechi" cateva clipe, cat isi opreste
-  // sarcina de citire ca sa treaca pe cel nou. Il tinem inca o runda, ca sa nu i-l stergem de
-  // sub el.
+  // NU mai eliberam automat bufferul vechi aici - vezi free_previous(). Daca a mai ramas unul
+  // neeliberat de la schimbarea anterioara (adica scriptul YAML nu a apucat sa cheme
+  // free_previous() inainte sa ceara deja o alta melodie noua), il eliberam acum, ca plasa de
+  // siguranta, ca sa nu pierdem memorie definitiv - dar in mod normal nu ar trebui sa se intample.
   if (this->buffer_dinainte_ != nullptr) {
+    ESP_LOGW(TAG, "free_previous() nu a fost chemat inainte de urmatoarea schimbare - eliberez acum, cu intarziere.");
     heap_caps_free(this->buffer_dinainte_);
+    this->buffer_dinainte_ = nullptr;
   }
   this->buffer_dinainte_ = this->buffer_acum_;
   this->buffer_acum_ = bufer_nou;
@@ -219,6 +235,13 @@ audio::AudioFile *SDCard::load_track(int index) {
   this->fisier_curent_.length = (size_t) marime;
   this->fisier_curent_.file_type = tip;
   return &this->fisier_curent_;
+}
+
+void SDCard::free_previous() {
+  if (this->buffer_dinainte_ != nullptr) {
+    heap_caps_free(this->buffer_dinainte_);
+    this->buffer_dinainte_ = nullptr;
+  }
 }
 
 void SDCard::scan_music() {
