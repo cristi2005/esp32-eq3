@@ -54,6 +54,12 @@ class SDCard : public Component {
   /// nu trebuie sa il elibereze singur.
   audio::AudioFile *load_track(int index);
 
+  /// @brief Elibereaza bufferul melodiei DINAINTEA celei curente, daca mai e tinut minte unul.
+  /// Apeleaz-o dupa ce te-ai asigurat ca melodia noua chiar canta (media_player.is_playing),
+  /// ca sa nu tii doua melodii intregi in memorie decat cat dureaza tranzitia. Sigur de apelat
+  /// oricand, chiar daca nu e nimic de eliberat.
+  void free_previous();
+
  protected:
   std::string mount_point_{"/sd"};
   std::string music_folder_{"/sd"};
@@ -70,9 +76,10 @@ class SDCard : public Component {
   uint8_t *citire_{nullptr};
 
   // Bufferul (mare, din memoria externa) cu melodia CURENTA, si cel cu melodia DINAINTEA ei.
-  // Il tinem pe cel dinainte inca o runda, nu il stergem imediat ce trecem la melodia noua -
-  // pipeline-ul audio mai poate avea nevoie de cateva clipe sa termine de citit din el cand
-  // schimbam sursa, si l-am sterge de sub el daca l-am elibera prea devreme.
+  // Cel dinainte NU se elibereaza automat la urmatoarea incarcare - ramane in viata pana cand
+  // cineva cheama explicit free_previous() (scriptul YAML o face imediat ce media_player confirma
+  // ca melodia noua chiar canta). Asa tinem fereastra in care exista doua melodii intregi simultan
+  // in memorie cat mai scurta posibil - doar tranzitia, nu o melodie intreaga.
   uint8_t *buffer_acum_{nullptr};
   uint8_t *buffer_dinainte_{nullptr};
   audio::AudioFile fisier_curent_{};
