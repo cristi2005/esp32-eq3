@@ -3,17 +3,17 @@
 #ifdef USE_ESP32
 
 #include "esphome/core/component.h"
-
-#include <esp_http_server.h>
+#include "esphome/components/audio/audio.h"
 
 #include <string>
 #include <vector>
 
 namespace esphome::sdcard {
 
-// Monteaza cardul SD (mod 1 fir) si porneste, LA CERERE, un server web care serveste
-// fisierele de pe el. Playerul obisnuit le cere apoi ca pe un post de radio, prin
-// http://127.0.0.1:<port>/<fisier>.
+// Monteaza cardul SD (mod 1 fir) si citeste melodiile de pe el, integral, in memoria externa
+// (PSRAM), la cerere - vezi load_track(). NU mai exista niciun server web: fisierul citit e dat
+// DIRECT playerului prin SpeakerMediaPlayer::play_file(), aceeasi metoda publica pe care o
+// foloseste si componenta oficiala "audio_file" a ESPHome-ului pentru sunete din firmware.
 class SDCard : public Component {
  public:
   // DATA: cardul trebuie montat devreme, ca sa fie gata cand alte componente il cauta.
@@ -24,7 +24,6 @@ class SDCard : public Component {
 
   void set_mount_point(const std::string &mount_point) { this->mount_point_ = mount_point; }
   void set_music_folder(const std::string &music_folder) { this->music_folder_ = music_folder; }
-  void set_http_port(uint16_t http_port) { this->http_port_ = http_port; }
 
   bool is_mounted() const { return this->mounted_; }
 
@@ -45,54 +44,38 @@ class SDCard : public Component {
   /// @brief Numele melodiei (fara cale), pentru afisat. Sir gol daca indexul e gresit.
   std::string track_name(int index) const;
 
-  /// @brief Adresa completa pe care i-o dai playerului. Sir gol daca indexul e gresit.
-  std::string track_url(int index) const;
-
-  /// @brief Porneste serverul de fisiere daca nu ruleaza deja. Apeleaz-o inainte de a cere
-  /// prima adresa de melodie intr-o sesiune de ascultare - vezi motivul la stop_server().
-  /// Nu face nimic daca serverul ruleaza deja.
-  void ensure_server_started();
-
-  /// @brief Inchide imediat, din afara, orice transfer de fisier ramas activ pe server, dar
-  /// LASA serverul pornit. Foloseste-o cand treci de la o melodie la alta, ca sa nu ramana
-  /// doua transferuri deschise deodata. Nu face nimic daca nu exista niciun transfer activ.
-  void stop_transfer();
-
-  /// @brief Opreste TOT serverul de fisiere (inclusiv conexiunea activa, daca exista) si
-  /// elibereaza memoria lui - bufferul de citire si stiva sarcinii web, cateva mii de octeti
-  /// din memoria interna, cea mai rara resursa a placii.
+  /// @brief Citeste melodia de la indexul dat, INTEGRAL, de pe card in memoria externa (PSRAM),
+  /// si intoarce un audio::AudioFile gata de dat direct la media_player-ul de tip "speaker"
+  /// prin play_file(). Intoarce nullptr daca indexul e gresit, tipul fisierului nu e recunoscut
+  /// (doar MP3/WAV/FLAC/OPUS), fisierul nu se poate deschide, sau nu mai e memorie externa
+  /// libera pentru el - in toate cazurile, doar scrie un avertisment in log, nu opreste placa.
   ///
-  /// De ce ne trebuie: serverul pornea automat la boot si ramanea alocat cat placa era
-  /// pornita, chiar daca nu se asculta nimic de pe card. Placa are un bug mai vechi si deja
-  /// cunoscut - la schimbarea intre surse cu frecvente de esantionare diferite, difuzorul isi
-  /// reface pe scurt canalul I2S, ceea ce cere si el o bucata de memorie DMA. Cat timp
-  /// serverul cardului statea mereu alocat, acea reconfigurare avea mai putina memorie la
-  /// dispozitie decat inainte de a exista suportul pentru card - iar uneori nu mai gasea loc
-  /// deloc si placa se bloca/repornea. Apeland stop_server() ori de cate ori pleci de pe
-  /// sursa card (spre radio sau Bluetooth) si ensure_server_started() cand te intorci la ea,
-  /// memoria e libera exact atunci cand difuzorul are mai multa nevoie de ea - la radio/BT,
-  /// unde cardul nu are ce cauta oricum. Nu face nimic daca serverul nu ruleaza.
-  void stop_server();
+  /// Bufferul intors ramane valabil pana la URMATOAREA chemare a lui load_track() - apelantul
+  /// nu trebuie sa il elibereze singur.
+  audio::AudioFile *load_track(int index);
 
  protected:
-  void start_http_server_();
-  /// @brief Trimite fisierul cerut, bucata cu bucata. Ruleaza pe sarcina serverului web.
-  static esp_err_t http_handler_(httpd_req_t *request);
-
   std::string mount_point_{"/sd"};
   std::string music_folder_{"/sd"};
-  uint16_t http_port_{81};
 
   bool mounted_{false};
   uint64_t size_mb_{0};
   char name_[8]{};
 
-  bool server_pornit_{false};
-  httpd_handle_t server_{nullptr};
-  uint8_t *buffer_{nullptr};
-  size_t buffer_size_{0};
-
   std::vector<std::string> tracks_;
+
+  // Bufferul (mic, din memoria INTERNA, potrivit pentru transfer direct) prin care trec toate
+  // citirile de pe card - vezi explicatia mare din load_track() despre de ce nu citim direct in
+  // memoria externa. Alocat o singura data, la prima folosire, si refolosit de fiecare data.
+  uint8_t *citire_{nullptr};
+
+  // Bufferul (mare, din memoria externa) cu melodia CURENTA, si cel cu melodia DINAINTEA ei.
+  // Il tinem pe cel dinainte inca o runda, nu il stergem imediat ce trecem la melodia noua -
+  // pipeline-ul audio mai poate avea nevoie de cateva clipe sa termine de citit din el cand
+  // schimbam sursa, si l-am sterge de sub el daca l-am elibera prea devreme.
+  uint8_t *buffer_acum_{nullptr};
+  uint8_t *buffer_dinainte_{nullptr};
+  audio::AudioFile fisier_curent_{};
 };
 
 }  // namespace esphome::sdcard
