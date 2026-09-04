@@ -468,6 +468,13 @@ void SDCard::flux_task_(void *param) {
       }
     }
 
+    // Aplicam pauza la fiecare bucla (ieftin, idempotent) - acelasi tipar folosit de pipeline-ul
+    // audio al ESPHome-ului insusi. decode() de mai jos, pe cont propriu, nu mai avanseaza
+    // decodarea cat timp e pe pauza (doar asteapta putin si revine) - vezi audio_decoder.cpp.
+    const bool pauza = self->flux_pauza_.load();
+    self->speaker_->set_pause_state(pauza);
+    decodor->set_pause_output_state(pauza);
+
     const audio::AudioDecoderState stare = decodor->decode(citire_terminata);
 
     if (!are_info && decodor->get_audio_stream_info().has_value()) {
@@ -505,12 +512,15 @@ void SDCard::flux_task_(void *param) {
   self->fisier_flux_ = nullptr;
 
   if (eroare || self->opreste_flux_.load()) {
-    // Eroare sau oprire ceruta (skip) - taiem sunetul imediat.
+    // Eroare sau oprire ceruta (skip) - taiem sunetul imediat. NU e o terminare naturala, deci
+    // NU trecem automat la urmatoarea melodie (ai apasat tu ceva, sau ceva chiar nu a mers).
     self->speaker_->stop();
   } else {
     // Sfarsit normal al melodiei - lasam speakerul sa termine de redat ce mai are in bufferul lui
-    // propriu, fara sa taie ultimele sunete.
+    // propriu, fara sa taie ultimele sunete, si anuntam YAML-ul (vezi consume_finished_naturally)
+    // ca sa poata trece singur la melodia urmatoare.
     self->speaker_->finish();
+    self->terminat_natural_.store(true);
   }
 
   self->decodor_flux_.reset();
