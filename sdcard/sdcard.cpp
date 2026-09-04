@@ -9,8 +9,6 @@
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 
@@ -24,149 +22,59 @@ namespace esphome::sdcard {
 
 static const char *const TAG = "sdcard";
 
-// Cat citim din card dintr-o data. 4 KB, si OBLIGATORIU din memoria interna - vezi mai jos de ce.
-static constexpr size_t BUFFER_SIZE = 4096;
+// Bufferul de citire prin memoria interna. 16 KB - mai mare decat inainte, pentru ca acum e
+// SINGURUL consumator de memorie al componentei (nu mai exista server, stiva, socket) si citirea
+// se face o singura data, la schimbarea melodiei, nu tot timpul redarii - merita sa fie rapida.
+static constexpr size_t CITIRE_BUFFER = 16 * 1024;
 static constexpr size_t MAX_TRACKS = 200;
+// Cat de mare poate fi o melodie ca sa incapa in memoria externa. La 128 kbps, 12 MB inseamna
+// peste 12 minute de muzica - ar trebui sa acopere orice fisier normal. Daca nu incape (sau nu
+// mai e loc din cauza altor lucruri care folosesc PSRAM), load_track() refuza politicos, cu
+// avertisment in log, fara sa opreasca placa.
+static constexpr size_t MELODIE_MAXIM = 12 * 1024 * 1024;
 
 namespace {
 
-/// Tipul fisierului, dupa terminatie. Sirurile sunt EXACT cele pe care le recunoaste ESPHome
-/// cand citeste antetul Content-Type - daca le schimbi, placa nu mai stie ce sa decodeze.
-const char *mime_pentru(const std::string &nume) {
+/// Tipul fisierului, dupa terminatie. Fiecare varianta e aparata cu #ifdef, pentru ca placa nu
+/// are neaparat compilate toate cele patru decodoare (aici, doar MP3 e sigur prezent).
+audio::AudioFileType tip_fisier_pentru(const std::string &nume) {
   auto punct = nume.rfind('.');
   if (punct == std::string::npos) {
-    return nullptr;
+    return audio::AudioFileType::NONE;
   }
   std::string ext = nume.substr(punct + 1);
   for (char &c : ext) {
     c = (char) tolower((unsigned char) c);
   }
+#ifdef USE_AUDIO_MP3_SUPPORT
   if (ext == "mp3") {
-    return "audio/mpeg";
+    return audio::AudioFileType::MP3;
   }
+#endif
+#ifdef USE_AUDIO_WAV_SUPPORT
   if (ext == "wav") {
-    return "audio/wav";
+    return audio::AudioFileType::WAV;
   }
+#endif
+#ifdef USE_AUDIO_FLAC_SUPPORT
   if (ext == "flac") {
-    return "audio/flac";
+    return audio::AudioFileType::FLAC;
   }
-  if (ext == "opus" || ext == "ogg") {
-    return "audio/ogg;codecs=opus";
+#endif
+#ifdef USE_AUDIO_OPUS_SUPPORT
+  if (ext == "opus") {
+    return audio::AudioFileType::OPUS;
   }
-  return nullptr;
-}
-
-/// Numele fisierelor pot contine spatii si diacritice, care nu au ce cauta intr-o adresa web.
-/// Le inlocuim cu %XX, si le desfacem inapoi in server.
-std::string codifica_adresa(const std::string &text) {
-  static const char *const HEXA = "0123456789ABCDEF";
-  std::string iesire;
-  iesire.reserve(text.size() + 8);
-  for (unsigned char c : text) {
-    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
-      iesire.push_back((char) c);
-    } else {
-      iesire.push_back('%');
-      iesire.push_back(HEXA[c >> 4]);
-      iesire.push_back(HEXA[c & 0x0F]);
-    }
-  }
-  return iesire;
-}
-
-std::string decodifica_adresa(const char *text) {
-  std::string iesire;
-  for (const char *p = text; *p != '\0'; p++) {
-    if (*p == '%' && p[1] != '\0' && p[2] != '\0') {
-      char hexa[3] = {p[1], p[2], '\0'};
-      iesire.push_back((char) strtol(hexa, nullptr, 16));
-      p += 2;
-    } else {
-      iesire.push_back(*p);
-    }
-  }
-  return iesire;
-}
-
-/// Calitatea fisierului in kbps.
-///
-/// ATENTIE, aici gresisem prima data: la inceputul redarii serverul NU e franat de player, ci
-/// toarna cat poate de repede ca sa umple rezervele. Socotind de la secunda zero ieseau cifre
-/// imposibile - 844 kbps pentru un MP3, ceea ce nu exista. Abia dupa ce rezervele s-au umplut
-/// livrarea se aseaza la ritmul real al muzicii.
-/// De-aia masuram doar din momentul in care lucrurile s-au linistit, si returnam 0 cat timp nu
-/// avem inca o bucata de timp asezata destul de lunga ca sa insemne ceva.
-unsigned kbps(size_t octeti_acum, size_t octeti_la_start, int64_t moment_start_us) {
-  if (moment_start_us == 0) {
-    return 0;  // n-am apucat sa intram in regim asezat
-  }
-  const int64_t durata_us = esp_timer_get_time() - moment_start_us;
-  if (durata_us < 10000000) {
-    return 0;  // sub 10 secunde de regim asezat, socoteala inca minte
-  }
-  const uint64_t octeti = (uint64_t) (octeti_acum - octeti_la_start);
-  return (unsigned) ((octeti * 8ULL * 1000000ULL) / (uint64_t) durata_us / 1000ULL);
-}
-
-/// Calitatea fisierului MP3 (kbps), citita din antetul primului cadru.
-///
-/// De ce ne trebuie: serverul nostru trebuie sa livreze la ritmul muzicii, ca un post de radio,
-/// nu cat de repede poate. Ca sa stie cat inseamna "ritmul muzicii", trebuie sa afle calitatea.
-/// Intoarce 0 daca nu recunoaste antetul; atunci nu franam deloc.
-unsigned mp3_kbps(FILE *fisier) {
-  static const uint16_t MPEG1_L3[15] = {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320};
-  static const uint16_t MPEG2_L3[15] = {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160};
-
-  // ATENTIE la marimea buffer-ului de mai jos: functia asta ruleaza pe sarcina serverului web,
-  // care are o stiva de cativa kilobyti. Prima varianta folosea un vector local de 4096 octeti
-  // si depasea stiva - placa se reseta cu "Guru Meditation Error" de fiecare data cand pornea o
-  // melodie. Aici tinem buffer-ul mic dinadins si sarim peste eticheta cu fseek, nu citind-o.
-  uint8_t cap[256];
-
-  if (fread(cap, 1, 10, fisier) != 10) {
-    fseek(fisier, 0, SEEK_SET);
-    return 0;
-  }
-
-  long inceput_audio = 0;
-  // Eticheta ID3v2 de la inceput poate avea si sute de kilobyti (coperta albumului). Nu o
-  // citim - ii aflam doar marimea si sarim peste ea. Marimea sta pe 4 octeti din care se
-  // foloseste doar cate 7 biti - asa e formatul.
-  if (cap[0] == 'I' && cap[1] == 'D' && cap[2] == '3') {
-    const long marime = ((long) (cap[6] & 0x7F) << 21) | ((long) (cap[7] & 0x7F) << 14) |
-                        ((long) (cap[8] & 0x7F) << 7) | (long) (cap[9] & 0x7F);
-    inceput_audio = 10 + marime;
-  }
-
-  if (fseek(fisier, inceput_audio, SEEK_SET) != 0) {
-    fseek(fisier, 0, SEEK_SET);
-    return 0;
-  }
-
-  const size_t citit = fread(cap, 1, sizeof(cap), fisier);
-  fseek(fisier, 0, SEEK_SET);
-
-  for (size_t i = 0; citit >= 4 && i + 3 < citit; i++) {
-    if (cap[i] != 0xFF || (cap[i + 1] & 0xE0) != 0xE0) {
-      continue;  // nu e inceput de cadru
-    }
-    const uint8_t versiune = (cap[i + 1] >> 3) & 0x03;  // 3 = MPEG1, 2 = MPEG2, 0 = MPEG2.5
-    const uint8_t strat = (cap[i + 1] >> 1) & 0x03;     // 1 = Layer III
-    const uint8_t index = (cap[i + 2] >> 4) & 0x0F;
-    if (strat != 1 || versiune == 1 || index == 0 || index == 15) {
-      continue;  // antet fara sens - cautam mai departe
-    }
-    return (versiune == 3) ? MPEG1_L3[index] : MPEG2_L3[index];
-  }
-  return 0;
+#endif
+  return audio::AudioFileType::NONE;
 }
 
 }  // namespace
 
 void SDCard::setup() {
   // Modul pe 1 fir foloseste doar GPIO 14, 15 si 2. Pe 4 fire ar mai cere 4, 12 si 13, iar
-  // GPIO13 e butonul KEY2. E de vreo trei ori mai lent, dar un fisier de muzica cere sub
-  // 40 KB pe secunda, deci nu se simte.
+  // GPIO13 e butonul KEY2. E de vreo trei ori mai lent, dar noi citim o melodie intreaga o
+  // singura data la schimbarea ei, nu in timp real, deci nu conteaza.
   sdmmc_host_t host = SDMMC_HOST_DEFAULT();
   host.flags = SDMMC_HOST_FLAG_1BIT;
 
@@ -201,312 +109,116 @@ void SDCard::setup() {
   ESP_LOGI(TAG, "Card montat la %s: %s, %llu MB", this->mount_point_.c_str(), this->name_, this->size_mb_);
 
   this->scan_music();
-  // Serverul NU se porneste aici - vezi ensure_server_started(). Cat timp nu asculti nimic de
-  // pe card, nu tine rost sa stea alocata memorie DMA pentru el.
 }
 
-void SDCard::ensure_server_started() {
-  if (this->server_pornit_) {
-    return;  // deja ruleaza
-  }
-  this->server_pornit_ = true;
-  this->start_http_server_();
-}
-
-void SDCard::stop_server() {
-  if (this->server_ == nullptr) {
-    return;  // nu ruleaza - nimic de oprit
-  }
-  // httpd_stop() inchide si conexiunile inca deschise, nu doar serverul - nu mai trebuie sa
-  // chemam separat stop_transfer() inainte.
-  httpd_stop(this->server_);
-  this->server_ = nullptr;
-  if (this->buffer_ != nullptr) {
-    heap_caps_free(this->buffer_);
-    this->buffer_ = nullptr;
-    this->buffer_size_ = 0;
-  }
-  this->server_pornit_ = false;
-  ESP_LOGI(TAG, "Server de fisiere oprit - memoria interna e libera pentru sursa noua. Acum: %u octeti.",
-           (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-}
-
-void SDCard::start_http_server_() {
-  if (this->http_port_ == 0) {
-    return;
+audio::AudioFile *SDCard::load_track(int index) {
+  if (index < 0 || index >= (int) this->tracks_.size()) {
+    ESP_LOGW(TAG, "Index de melodie invalid: %d", index);
+    return nullptr;
   }
 
-  // AICI ERA (O PARTE DIN) CAUZA INTRERUPERILOR, si e scrisa in documentatia Espressif despre
-  // driverul de card.
-  //
-  // Cititorul de card nu poate scrie direct in memoria externa (PSRAM) - acolo nu ajunge canalul
-  // lui de transfer direct. Cand ii dai o rezerva din PSRAM, driverul nu refuza: se descurca
-  // singur, copiind prin propria lui rezerva interna, dar o face BLOC CU BLOC, cate 512 octeti,
-  // fiecare cu comanda lui separata catre card si cu o alocare de memorie proprie.
-  //
-  // Adica citirea noastra de 16 KB se rupea in 32 de transferuri marunte, cu 32 de alocari.
-  // De-aia o citire dura 120-150 ms in loc de vreo 10, si de-aia macina procesorul si memoria
-  // exact in timpul redarii. Radioul nu suferea fiindca el nu atinge niciodata cardul.
-  //
-  // Rezerva trebuie sa fie in memoria INTERNA si potrivita pentru transfer direct.
-  // 4 KB, nu 8: cu 8 KB placa a ramas fara memorie interna in timpul redarii - au aparut
-  // "allocate_dma_buf: not enough mem" si "HTTP_CLIENT: Failed to allocate memory". Memoria
-  // interna e resursa cea mai scumpa de pe placa asta.
-  this->buffer_ = (uint8_t *) heap_caps_malloc(BUFFER_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-  this->buffer_size_ = BUFFER_SIZE;
-  if (this->buffer_ == nullptr) {
-    // Ultima incercare, cu o rezerva mai mica.
-    this->buffer_ = (uint8_t *) heap_caps_malloc(4096, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-    this->buffer_size_ = 4096;
-  }
-  if (this->buffer_ == nullptr) {
-    ESP_LOGE(TAG, "Nu am memorie pentru rezerva de citire - serverul nu porneste.");
-    return;
+  const std::string &nume = this->tracks_[index];
+  const audio::AudioFileType tip = tip_fisier_pentru(nume);
+  if (tip == audio::AudioFileType::NONE) {
+    ESP_LOGW(TAG, "Tip de fisier necunoscut sau nesuportat: %s", nume.c_str());
+    return nullptr;
   }
 
-  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-  config.server_port = this->http_port_;
-  // ATENTIE: pagina web a placii foloseste deja portul de control implicit (32768). Doua
-  // servere cu acelasi port de control nu pornesc - de-aia il mutam pe al nostru.
-  config.ctrl_port = 32769;
-  // PRIORITATEA - aici era buba, si e cel mai important rand din tot fisierul.
-  // Serverul web al ESP-IDF porneste implicit cu prioritatea 5. Dar decodorul de MP3 al
-  // ESPHome (cel care trebuie sa tina pasul cu muzica, fara nicio pauza) ruleaza cu
-  // prioritatea 1 - verificat in speaker_media_player.cpp, MEDIA_PIPELINE_TASK_PRIORITY = 1.
-  // Adica serverul nostru era de cinci ori mai important decat decodorul si il dadea la o
-  // parte de fiecare data cand avea ceva de trimis, adica tot timpul. De-aia radioul mergea
-  // curat (datele vin din afara, nu exista niciun server pe placa) si de-aia n-a ajutat nimic
-  // din ce am oprit: egalizator, leduri, pagina web - toate stau si ele pe prioritate mica.
-  // Pus pe 1, serverul si decodorul isi impart procesorul in mod egal, pe rand.
-  config.task_priority = 1;
-  // Un singur socket: servim o singura melodie la un moment dat, iar fiecare socket costa
-  // memorie interna, care e pe terminate.
-  config.max_open_sockets = 1;
-  // 6 KB, nu 4: citirea prin sistemul de fisiere consuma si ea din stiva sarcinii, iar noi mai
-  // avem si buffere locale in tratarea cererii. Cu 4 KB eram prea aproape de margine.
-  config.stack_size = 5120;
-  config.lru_purge_enable = true;
-  config.uri_match_fn = httpd_uri_match_wildcard;
-
-  esp_err_t err = httpd_start(&this->server_, &config);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Serverul de fisiere nu a pornit: %s", esp_err_to_name(err));
-    this->server_ = nullptr;
-    return;
-  }
-
-  httpd_uri_t uri = {};
-  uri.uri = "/*";
-  uri.method = HTTP_GET;
-  uri.handler = SDCard::http_handler_;
-  uri.user_ctx = this;
-  httpd_register_uri_handler(this->server_, &uri);
-
-  ESP_LOGI(TAG, "Server de fisiere pornit pe portul %u. Memorie interna libera: %u octeti "
-                "(cel mai mare bloc: %u).",
-           this->http_port_, (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-           (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-}
-
-esp_err_t SDCard::http_handler_(httpd_req_t *request) {
-  auto *self = (SDCard *) request->user_ctx;
-
-  // Sarim peste "/" de la inceput si taiem eventualul "?..." de la sfarsit.
-  std::string nume = decodifica_adresa(request->uri + 1);
-  auto intrebare = nume.find('?');
-  if (intrebare != std::string::npos) {
-    nume.resize(intrebare);
-  }
-
-  // Fara ".." si fara cai absolute: altfel oricine din retea ar putea cere orice fisier.
-  if (nume.empty() || nume.find("..") != std::string::npos || nume[0] == '/') {
-    httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Nume de fisier nepermis");
-    return ESP_FAIL;
-  }
-
-  const char *mime = mime_pentru(nume);
-  if (mime == nullptr) {
-    httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Nu e fisier de muzica");
-    return ESP_FAIL;
-  }
-
-  std::string cale = self->music_folder_ + "/" + nume;
+  const std::string cale = this->music_folder_ + "/" + nume;
   FILE *fisier = fopen(cale.c_str(), "rb");
   if (fisier == nullptr) {
     ESP_LOGW(TAG, "Nu gasesc fisierul %s", cale.c_str());
-    httpd_resp_send_err(request, HTTPD_404_NOT_FOUND, "Fisier inexistent");
-    return ESP_FAIL;
+    return nullptr;
   }
 
-  // ANTET SCRIS DE MANA, ca al unui post de radio.
-  //
-  // Pana acum foloseam metoda obisnuita a serverului, care imparte raspunsul in bucati, fiecare
-  // cu mărimea ei scrisa inainte ("chunked"). Un post de radio nu face asa: trimite un suvoi
-  // continuu de octeti, fara sa spuna niciodata cat e de lung, pana inchide legatura. Ambele
-  // sunt HTTP corect, dar clientul le trateaza diferit - iar clientul e codul ESPHome, pe care
-  // nu-l putem schimba. Aici ne purtam exact ca un post de radio.
-  {
-    char antet[200];
-    const int lungime = snprintf(antet, sizeof(antet),
-                                 "HTTP/1.1 200 OK\r\n"
-                                 "Content-Type: %s\r\n"
-                                 "Connection: close\r\n"
-                                 "Cache-Control: no-cache\r\n"
-                                 "\r\n",
-                                 mime);
-    if (lungime <= 0 || httpd_send(request, antet, lungime) < 0) {
-      fclose(fisier);
-      return ESP_FAIL;
+  if (fseek(fisier, 0, SEEK_END) != 0) {
+    fclose(fisier);
+    ESP_LOGW(TAG, "Nu pot afla marimea fisierului %s", nume.c_str());
+    return nullptr;
+  }
+  const long marime = ftell(fisier);
+  fseek(fisier, 0, SEEK_SET);
+  if (marime <= 0) {
+    fclose(fisier);
+    ESP_LOGW(TAG, "Fisier gol sau ilizibil: %s", nume.c_str());
+    return nullptr;
+  }
+  if ((size_t) marime > MELODIE_MAXIM) {
+    fclose(fisier);
+    ESP_LOGW(TAG, "Melodia %s e prea mare (%ld KB, maxim %u KB) - o sar.", nume.c_str(), marime / 1024,
+             (unsigned) (MELODIE_MAXIM / 1024));
+    return nullptr;
+  }
+
+  uint8_t *bufer_nou = (uint8_t *) heap_caps_malloc((size_t) marime, MALLOC_CAP_SPIRAM);
+  if (bufer_nou == nullptr) {
+    fclose(fisier);
+    ESP_LOGE(TAG, "Nu (mai) am memorie externa pentru %s (%ld KB).", nume.c_str(), marime / 1024);
+    return nullptr;
+  }
+
+  // AICI ERA CAUZA INTRERUPERILOR, si e scrisa in documentatia Espressif despre driverul de
+  // card: canalul de transfer direct al cititorului de card nu ajunge in memoria EXTERNA. Daca
+  // am citi direct in "bufer_nou" (care e in PSRAM) cu fread(), driverul ar copia bloc cu bloc,
+  // cate 512 octeti, fiecare cu comanda si alocare proprie - mult mai incet. De-aia citim intai
+  // prin "citire_", care e in memoria INTERNA (rapid), si abia apoi copiem bucata cu memcpy() in
+  // bufferul mare din memoria externa - o simpla copiere in memorie, fara nicio implicare a
+  // cardului, deci instantanee.
+  if (this->citire_ == nullptr) {
+    this->citire_ = (uint8_t *) heap_caps_malloc(CITIRE_BUFFER, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    if (this->citire_ == nullptr) {
+      ESP_LOGW(TAG, "Nu am memorie interna pentru bufferul de citire - citesc mai incet, direct.");
     }
   }
 
-  // FRANA - asta e miezul reparatiei. Fara ea serverul toarna fisierul cat de repede poate, iar
-  // sarcina care citeste nu mai doarme niciodata si se cearta cu decodorul pe procesor (au
-  // aceeasi prioritate). Un post de radio nu face asta: el livreaza la ritmul muzicii, iar
-  // cititorul doarme intre pachete. Aici ne purtam la fel.
-  const unsigned calitate_kbps = mp3_kbps(fisier);
-  // Octeti pe secunda, cu doar 5% peste ritmul real. Marja trebuie sa fie MICA dinadins: daca
-  // livram mult mai repede decat se consuma, rezerva playerului se umple, iar cititorul lui
-  // incepe iar sa se invarta incercand sa bage date intr-un vas plin - exact starea de care
-  // fugim. Cu 5%, rezerva se umple atat de incet incat nu apuca sa se umple pana la finalul
-  // melodiei, iar cititorul sta linistit, asteptand date, ca la radio.
-  const uint32_t ritm_octeti_pe_sec = (calitate_kbps > 0) ? (uint32_t) (calitate_kbps * 1000 / 8 * 21 / 20) : 0;
-  // Primii 512 KB ii trimitem nefranati: sunt vreo 30 de secunde de muzica pusa deoparte, din
-  // care playerul porneste imediat si are din ce trai daca placa se impiedica de ceva.
-  static constexpr size_t AVANS = 512 * 1024;
-  ESP_LOGI(TAG, "Trimit %s: %u kbps, franez la %u KB/s dupa primii %u KB. Memorie interna "
-                "libera: %u octeti.",
-           nume.c_str(), calitate_kbps, (unsigned) (ritm_octeti_pe_sec / 1024), (unsigned) (AVANS / 1024),
-           (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-
-  // AICI ERA CEALALTA JUMATATE A PROBLEMEI (cea care mai ramasese dupa reparatia de mai sus).
-  //
-  // Pana acum, fisierele sub 2 MB erau citite dintr-o data, in intregime, intr-un buffer din
-  // memoria EXTERNA (PSRAM), cu un singur fread(). Asta insemna exact aceeasi boala descrisa
-  // mai sus - driverul de card copia acel buffer mare tot bloc-cu-bloc de 512 octeti, la fel
-  // de incet ca inainte de reparatie. Preincarcarea dura pana la 2-3 secunde, si dura DUPA ce
-  // antetul HTTP era deja trimis catre player - adica playerul stia ca melodia incepe, dar nu
-  // primea niciun octet de muzica pana se termina preincarcarea. Exact in fereastra aia se
-  // rupea sunetul, la fiecare schimbare de melodie - de-aia se auzea "cate putin, la unele
-  // melodii mai mult, la altele mai putin": depindea de cat de aproape era fisierul de pragul
-  // de 2 MB, deci de cat dura preincarcarea lui.
-  //
-  // Preincarcarea a fost utila doar ca test, ca sa dovedim ca vina nu era a cardului - lucru
-  // dovedit deja. Acum ca citirea pe bucati foloseste memoria interna (rapida), nu mai are
-  // niciun rost sa o pastram, asa ca am scos-o de tot: citim direct pe bucati, ca la radio.
-  size_t octeti = 0;
-
-  // MASURATOARE (temporara, pentru intreruperi): cronometram separat citirea de pe card si
-  // trimiterea catre player. Daca sunetul se rupe, una din cele doua se opreste undeva.
-  // Scriem in log doar cand chiar dureaza mult, altfel am ineca consola.
-  // Pragul a fost 120 ms, dar masuratoarea ne-a lamurit ca asteptarile de ~1,4 s la trimitere
-  // sunt NORMALE: playerul consuma la ritmul muzicii, iar noi asteptam sa faca loc. Nu e o
-  // blocare, e franare naturala. Ridicat la 2,5 s ca sa iasa in log doar opririle adevarate.
-  static constexpr int64_t PRAG_US = 2500000;  // 2,5 s
-  int64_t maxim_card_us = 0;
-  int64_t maxim_retea_us = 0;
-  uint32_t bucati = 0;
-
-  const int64_t inceput_us = esp_timer_get_time();
-  // Momentul si numarul de octeti de la care incepe regimul asezat (dupa umplerea rezervelor).
-  int64_t asezat_us = 0;
-  size_t asezat_octeti = 0;
-
-  size_t citit;
-  while (true) {
-    int64_t t0 = esp_timer_get_time();
-    citit = fread(self->buffer_, 1, self->buffer_size_, fisier);
-    int64_t t1 = esp_timer_get_time();
+  const int64_t start_us = esp_timer_get_time();
+  size_t scris = 0;
+  while (scris < (size_t) marime) {
+    const size_t de_citit = std::min(CITIRE_BUFFER, (size_t) marime - scris);
+    size_t citit;
+    if (this->citire_ != nullptr) {
+      citit = fread(this->citire_, 1, de_citit, fisier);
+      if (citit > 0) {
+        std::memcpy(bufer_nou + scris, this->citire_, citit);
+      }
+    } else {
+      // Plasa de siguranta, daca nu s-a putut aloca bufferul mic: citim direct in memoria
+      // externa - mai incet, dar macar functioneaza.
+      citit = fread(bufer_nou + scris, 1, de_citit, fisier);
+    }
     if (citit == 0) {
       break;
     }
-
-    // Trimitem octetii bruti, fara nicio impachetare - exact ca un post de radio.
-    const int rezultat = httpd_send(request, (const char *) self->buffer_, citit);
-    const esp_err_t trimis = (rezultat == (int) citit) ? ESP_OK : ESP_FAIL;
-    int64_t t2 = esp_timer_get_time();
-
-    const int64_t card_us = t1 - t0;
-    const int64_t retea_us = t2 - t1;
-    maxim_card_us = std::max(maxim_card_us, card_us);
-    maxim_retea_us = std::max(maxim_retea_us, retea_us);
-    bucati++;
-    octeti += citit;
-
-    // FRANA: daca am trimis mai mult decat ii trebuie muzicii pana acum, dormim diferenta.
-    // Somnul asta e tot rostul: cat dormim noi, decodorul are procesorul numai pentru el.
-    if (ritm_octeti_pe_sec > 0 && octeti > AVANS) {
-      const int64_t scurs_ms = (t2 - inceput_us) / 1000;
-      const int64_t cuvenit = (int64_t) AVANS + (int64_t) ritm_octeti_pe_sec * scurs_ms / 1000;
-      if ((int64_t) octeti > cuvenit) {
-        const int64_t exces = (int64_t) octeti - cuvenit;
-        int64_t somn_ms = exces * 1000 / (int64_t) ritm_octeti_pe_sec;
-        if (somn_ms > 500) {
-          somn_ms = 500;  // niciodata mai mult de o jumatate de secunda dintr-o data
-        }
-        if (somn_ms > 0) {
-          vTaskDelay(pdMS_TO_TICKS(somn_ms));
-        }
-      }
-    }
-
-    // Dupa 12 secunde consideram ca rezervele s-au umplut si livrarea merge la ritmul muzicii.
-    // De aici incolo masuram calitatea reala a fisierului.
-    if (asezat_us == 0 && (t2 - inceput_us) > 12000000) {
-      asezat_us = t2;
-      asezat_octeti = octeti;
-    }
-
-    if (card_us > PRAG_US || retea_us > PRAG_US) {
-      ESP_LOGW(TAG, "Bucata %u: cititul de pe card %lld ms, trimiterea %lld ms", (unsigned) bucati,
-               (long long) (card_us / 1000), (long long) (retea_us / 1000));
-    }
-
-    if (trimis != ESP_OK) {
-      // Playerul a inchis legatura (ai schimbat melodia, de exemplu) - nu e o eroare.
-      fclose(fisier);
-      ESP_LOGI(TAG, "Oprit dupa %u bucati (%u KB). Card: cel mai lung %lld ms. "
-                    "Trimitere: cea mai lunga %lld ms. Calitate: ~%u kbps (0 = prea scurt "
-                    "ca sa pot masura; lasa melodia sa cante 25 de secunde).",
-               (unsigned) bucati, (unsigned) (octeti / 1024), (long long) (maxim_card_us / 1000),
-               (long long) (maxim_retea_us / 1000), kbps(octeti, asezat_octeti, asezat_us));
-      return ESP_FAIL;
-    }
+    scris += citit;
   }
   fclose(fisier);
 
-  const unsigned calitate = kbps(octeti, asezat_octeti, asezat_us);
-  ESP_LOGI(TAG, "Fisier terminat: %u bucati (%u KB). Card: cel mai lung %lld ms. "
-                "Trimitere: cea mai lunga %lld ms. Calitate: ~%u kbps (0 = prea scurt).",
-           (unsigned) bucati, (unsigned) (octeti / 1024), (long long) (maxim_card_us / 1000),
-           (long long) (maxim_retea_us / 1000), calitate);
-  if (calitate > 200) {
-    ESP_LOGW(TAG, "Peste 200 kbps - placa are de tras si sunetul se poate rupe. "
-                  "Sub 192 kbps merge curat.");
+  if (scris != (size_t) marime) {
+    ESP_LOGW(TAG, "Citire incompleta pentru %s: %u din %ld octeti - o sar.", nume.c_str(), (unsigned) scris,
+             marime);
+    heap_caps_free(bufer_nou);
+    return nullptr;
   }
 
-  // Fara impachetare nu exista "bucata de lungime zero" - sfarsitul se anunta inchizand
-  // legatura, exact cum face un post de radio cand se termina emisiunea.
-  httpd_sess_trigger_close(request->handle, httpd_req_to_sockfd(request));
-  return ESP_OK;
-}
+  const int64_t durata_ms = (esp_timer_get_time() - start_us) / 1000;
+  ESP_LOGI(TAG, "Melodia \"%s\" incarcata in memoria externa: %u KB in %lld ms (%.1f KB/s).", nume.c_str(),
+           (unsigned) (marime / 1024), (long long) durata_ms,
+           durata_ms > 0 ? (marime / 1024.0) / (durata_ms / 1000.0) : 0.0);
 
-void SDCard::stop_transfer() {
-  if (this->server_ == nullptr) {
-    return;
+  // Eliberam bufferul melodiei DINAINTEA celei dinainte (nu pe cel curent!) - pipeline-ul audio
+  // poate inca sa citeasca din cel care tocmai a devenit "vechi" cateva clipe, cat isi opreste
+  // sarcina de citire ca sa treaca pe cel nou. Il tinem inca o runda, ca sa nu i-l stergem de
+  // sub el.
+  if (this->buffer_dinainte_ != nullptr) {
+    heap_caps_free(this->buffer_dinainte_);
   }
-  // Cerem serverului lista conexiunilor active (la noi, cel mult una - vezi max_open_sockets)
-  // si le inchidem pe rand, din afara sarcinii care le deserveste. E exact metoda recomandata
-  // de ESP-IDF pentru inchidere asincrona - vezi httpd_sess_trigger_close in documentatie.
-  size_t nr = 4;
-  int fds[4];
-  if (httpd_get_client_list(this->server_, &nr, fds) == ESP_OK) {
-    for (size_t i = 0; i < nr; i++) {
-      if (fds[i] >= 0) {
-        httpd_sess_trigger_close(this->server_, fds[i]);
-      }
-    }
-  }
+  this->buffer_dinainte_ = this->buffer_acum_;
+  this->buffer_acum_ = bufer_nou;
+
+  this->fisier_curent_.data = this->buffer_acum_;
+  this->fisier_curent_.length = (size_t) marime;
+  this->fisier_curent_.file_type = tip;
+  return &this->fisier_curent_;
 }
 
 void SDCard::scan_music() {
@@ -527,8 +239,8 @@ void SDCard::scan_music() {
     if (intrare->d_type == DT_DIR) {
       continue;
     }
-    if (mime_pentru(intrare->d_name) == nullptr) {
-      continue;  // nu e fisier de muzica
+    if (tip_fisier_pentru(intrare->d_name) == audio::AudioFileType::NONE) {
+      continue;  // nu e fisier de muzica recunoscut
     }
     this->tracks_.emplace_back(intrare->d_name);
     if (this->tracks_.size() >= MAX_TRACKS) {
@@ -557,14 +269,6 @@ std::string SDCard::track_name(int index) const {
   return this->tracks_[index];
 }
 
-std::string SDCard::track_url(int index) const {
-  if (index < 0 || index >= (int) this->tracks_.size()) {
-    return {};
-  }
-  // 127.0.0.1 inseamna "placa insasi" - cererea nu iese in retea, deci merge si fara WiFi.
-  return "http://127.0.0.1:" + std::to_string(this->http_port_) + "/" + codifica_adresa(this->tracks_[index]);
-}
-
 void SDCard::dump_config() {
   ESP_LOGCONFIG(TAG, "Card SD:");
   ESP_LOGCONFIG(TAG, "  Folder: %s", this->mount_point_.c_str());
@@ -575,7 +279,6 @@ void SDCard::dump_config() {
   } else {
     ESP_LOGCONFIG(TAG, "  Montat: NU");
   }
-  ESP_LOGCONFIG(TAG, "  Server fisiere: %s (port %u)", this->server_ != nullptr ? "pornit" : "oprit", this->http_port_);
 }
 
 void SDCard::list_files(const std::string &path) {
